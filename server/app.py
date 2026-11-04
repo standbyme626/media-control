@@ -539,8 +539,7 @@ async function loadVideos(force, silent){
     const u = (d.tab || {}).url || '';
     const m = u.match(/[?&]keyword=([^&]+)/);
     if(m){
-      try { $('q').value = decodeURIComponent(m[1].replace(/\+/g, ' ')); } catch(e) {}
-      lastQuery = $('q').value.trim();
+      try { lastQuery = decodeURIComponent(m[1].replace(/\+/g, ' ')).trim(); } catch(e) { lastQuery = ''; }
       const pm = u.match(/[?&]page=(\d+)/);
       if(pm) searchPage = Math.max(1, parseInt(pm[1], 10) || 1);
     }
