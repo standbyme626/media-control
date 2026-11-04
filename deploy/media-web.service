@@ -1,0 +1,13 @@
+[Unit]
+Description=Media web control (Windows bridge + CDP)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/media-web/app.py
+EnvironmentFile=/etc/media-web.env
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
