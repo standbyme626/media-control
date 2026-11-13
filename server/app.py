@@ -2,7 +2,8 @@
 """Fixed-action media control page for the Windows bridge.
 
 Security model:
-- Only GET / , GET /api/status, GET /api/health, POST /api/pause, POST /api/play.
+- Fixed endpoints only: status, play/pause, next/prev, mute, seek, volume,
+  sleep timer, wake-on-LAN, tabs, Bilibili search/open.
 - No user-controlled path, file name, command or action string reaches a shell.
 - SSH command is a fixed argv list; the bridge path is one of two constants.
 - HTTP Basic auth (over the TLS reverse proxy) + per-process CSRF header.
@@ -18,6 +19,7 @@ import os
 import pathlib
 import re
 import secrets
+import socket
 import subprocess
 import threading
 import time
@@ -73,9 +75,12 @@ _VIDEOS = {"ts": 0.0, "data": None}
 _VIDEOS_LOCK = threading.Lock()
 
 WIN_HOST = os.environ.get("MEDIA_WIN_HOST", "windows-host")
-BRIDGE = os.environ.get("MEDIA_BRIDGE_URL", "http://127.0.0.1:8765/")
+WIN_MAC = os.environ.get("MEDIA_WIN_MAC", "")
 SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", WIN_HOST]
-ACTIONS = {"pause", "play"}
+BRIDGE = os.environ.get("MEDIA_BRIDGE_URL", "http://127.0.0.1:8765/")
+ACTIONS = {"pause", "play", "next", "prev", "mute"}
+_SLEEP = {"timer": None, "due": 0.0}
+_SLEEP_LOCK = threading.Lock()
 
 _RATE: dict[str, deque] = defaultdict(deque)
 _RATE_LOCK = threading.Lock()
@@ -106,6 +111,10 @@ def _bridge(path: str) -> dict:
 
 
 def _status() -> dict:
+    online = _pc_online()
+    if online is False:
+        return {"ok": False, "error": "电脑离线", "pc_online": False,
+                "sleep_due": _sleep_due()}
     try:
         cdp = _bridge("cdp/status")
         if cdp.get("ok"):
@@ -115,15 +124,22 @@ def _status() -> dict:
                 "app": "Microsoft Edge（受控）",
                 "status": "paused" if cdp.get("paused") else "playing",
                 "volume": cdp.get("volume"),
+                "muted": cdp.get("muted"),
                 "url": cdp.get("url") or "",
                 "pos": cdp.get("t"),
                 "dur": cdp.get("dur"),
                 "backend": "cdp",
+                "pc_online": online,
+                "sleep_due": _sleep_due(),
                 "updated": int(time.time()),
             }
     except Exception:
         pass
-    data = _bridge("list")
+    try:
+        data = _bridge("list")
+    except Exception:
+        return {"ok": False, "error": "媒体桥不可达", "pc_online": online,
+                "sleep_due": _sleep_due()}
     chosen = data.get("chosen") or {}
     return {
         "ok": True,
@@ -131,13 +147,87 @@ def _status() -> dict:
         "app": chosen.get("app") or "",
         "status": chosen.get("status_name") or "unknown",
         "volume": data.get("volume"),
+        "muted": data.get("muted"),
         "backend": "smtc",
+        "pc_online": online,
+        "sleep_due": _sleep_due(),
         "updated": int(time.time()),
     }
 
 
 def _set_volume(level: int) -> dict:
     return _bridge("volume?level=%d" % level)
+
+
+def _pc_online(timeout: float = 1.2):
+    if not WIN_HOST:
+        return None
+    try:
+        with socket.create_connection((WIN_HOST, 22), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _wake() -> dict:
+    mac = re.sub(r"[^0-9A-Fa-f]", "", WIN_MAC or "")
+    if len(mac) != 12:
+        return {"ok": False, "error": "wake unavailable"}
+    payload = b"\xff" * 6 + bytes.fromhex(mac) * 16
+    targets = ["255.255.255.255"]
+    parts = WIN_HOST.split(".")
+    if len(parts) == 4:
+        targets.append(".".join(parts[:3]) + ".255")
+    sent = []
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        try:
+            for target in targets:
+                for port in (9, 7):
+                    try:
+                        s.sendto(payload, (target, port))
+                        sent.append(target)
+                    except OSError:
+                        pass
+        finally:
+            s.close()
+    except OSError:
+        pass
+    return {"ok": bool(sent), "sent": sorted(set(sent))}
+
+
+def _sleep_due() -> int:
+    with _SLEEP_LOCK:
+        return int(_SLEEP["due"]) if _SLEEP["due"] > time.time() else 0
+
+
+def _sleep_fire() -> None:
+    with _SLEEP_LOCK:
+        _SLEEP["timer"] = None
+        _SLEEP["due"] = 0.0
+    try:
+        _bridge("pause")
+    except Exception:
+        pass
+
+
+def _set_sleep(minutes: int) -> dict:
+    with _SLEEP_LOCK:
+        if _SLEEP["timer"] is not None:
+            _SLEEP["timer"].cancel()
+        _SLEEP["timer"] = None
+        _SLEEP["due"] = 0.0
+        if minutes <= 0:
+            return {"ok": True, "sleep": 0, "due": 0}
+        due = time.time() + minutes * 60
+        timer = threading.Timer(minutes * 60, _sleep_fire)
+        timer.daemon = True
+        timer.start()
+        _SLEEP["timer"] = timer
+        _SLEEP["due"] = due
+        return {"ok": True, "sleep": minutes, "due": int(due)}
+
 
 
 MUSIC_RE = re.compile(
@@ -286,14 +376,14 @@ def _check_state(value: str) -> bool:
 def _allowed_openid(open_id: str) -> bool:
     p = pathlib.Path(FEISHU_OPENID_FILE)
     try:
-        current = p.read_text(encoding="utf-8").strip()
+        lines = [x.strip() for x in p.read_text(encoding="utf-8").splitlines() if x.strip()]
     except FileNotFoundError:
-        current = ""
-    if not current:
+        lines = []
+    if not lines:
         p.write_text(open_id + "\n", encoding="utf-8")
         p.chmod(0o600)
         return True
-    return hmac.compare_digest(current, open_id)
+    return any(hmac.compare_digest(x, open_id) for x in lines)
 
 
 PAGE = r"""<!doctype html>
@@ -320,6 +410,17 @@ h1{font-size:17px;margin:0;font-weight:650;letter-spacing:.2px}
 .vol{display:flex;align-items:center;gap:12px;margin:0 2px 16px}
 .vol input[type=range]{flex:1;accent-color:#2563eb;height:4px;cursor:pointer}
 .vol #volVal{min-width:42px;text-align:right}
+.progress{display:flex;align-items:center;gap:10px;margin:0 2px 14px}
+.progress input[type=range]{flex:1;min-width:0;accent-color:#2563eb;height:4px;cursor:pointer}
+.progress input[type=range]:disabled{opacity:.35}
+.progress #posTxt{min-width:88px;text-align:right;font-variant-numeric:tabular-nums}
+.actions .btn.small{flex:0 0 52px;padding:13px 0;font-size:17px}
+.row2{display:flex;align-items:center;gap:10px;margin:0 0 14px}
+.row2 .btn.mute{flex:0 0 auto;padding:10px 14px;font-size:13px}
+.sleep{display:flex;align-items:center;gap:8px;font-size:12px;color:#8fa1b3;margin-left:auto}
+.sleep select{background:#0d141c;border:1px solid #223042;color:#e8eef5;border-radius:8px;padding:7px 8px;font-size:12px}
+.wake{display:none;margin:0 0 12px}
+.wake.show{display:block}
 .search{display:flex;gap:8px;margin:0 0 12px}
 .search input{flex:1;min-width:0;background:#0d141c;border:1px solid #223042;border-radius:10px;color:#e8eef5;padding:10px 12px;font-size:14px;outline:none}
 .search input:focus{border-color:#2563eb}
@@ -345,6 +446,25 @@ h1{font-size:17px;margin:0;font-weight:650;letter-spacing:.2px}
 .link{border:0;background:none;color:#7fb0ff;font-size:13px;cursor:pointer;padding:0}
 .note{margin-top:16px;padding-top:12px;border-top:1px solid #1d2a38;color:#64748b;font-size:11px;line-height:1.5}
 #msg{margin-left:auto}
+.body{display:flex;flex-direction:column}
+.controls,.browse{display:contents}
+.track{order:1}.progress{order:3}.search{order:4}.refreshbar{order:5}#results{order:6}.vol{order:7}.actions{order:8}.row2{order:9}.foot{order:10}
+@media (min-width:900px){
+  body{align-items:flex-start;padding:26px 18px}
+  .card{width:min(94vw,1120px);padding:26px}
+  .head{margin-bottom:22px}
+  .body{display:grid;grid-template-columns:380px minmax(0,1fr);gap:0 24px;align-items:start}
+  .controls,.browse{display:block}
+  .controls{position:sticky;top:26px}
+  #results{max-height:64vh;min-height:300px}
+}
+@media (min-width:1150px){
+  #results{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1px;align-content:start;background:#1d2a38}
+  #results .video{background:#0d141c;border:0;padding:12px}
+  #results .video:hover{background:#17222e}
+  #results .video img{width:132px;height:74px}
+  #results .tab-empty{grid-column:1/-1;background:#0d141c}
+}
 </style>
 </head>
 <body>
@@ -354,44 +474,108 @@ h1{font-size:17px;margin:0;font-weight:650;letter-spacing:.2px}
     <div><h1>媒体控制</h1><p class="muted">Windows 媒体桥</p></div>
     <span id="badge" class="badge">加载中</span>
   </div>
-  <div class="track">
-    <div id="title" class="title">—</div>
-    <div id="app" class="muted">—</div>
+  <div class="body">
+    <div class="controls">
+      <div class="track">
+        <div id="title" class="title">—</div>
+        <div id="app" class="muted">—</div>
+      </div>
+      <div class="wake" id="wakeBox">
+        <button id="wake" class="btn primary">⚡ 唤醒电脑</button>
+      </div>
+      <div class="progress">
+        <input id="seek" type="range" min="0" max="1" step="1" value="0" disabled aria-label="播放进度">
+        <span id="posTxt" class="muted">--:-- / --:--</span>
+      </div>
+      <div class="vol">
+        <span id="volIcon" title="系统音量">🔊</span>
+        <input id="vol" type="range" min="0" max="100" step="1" value="30" aria-label="系统音量">
+        <span id="volVal" class="muted">--%</span>
+      </div>
+      <div class="actions">
+        <button id="prev" class="btn small" title="上一首">⏮</button>
+        <button id="play" class="btn">▶ 播放</button>
+        <button id="pause" class="btn primary">⏸ 暂停</button>
+        <button id="next" class="btn small" title="下一首">⏭</button>
+      </div>
+      <div class="row2">
+        <button id="mute" class="btn mute">🔊 静音</button>
+        <label class="sleep">睡眠
+          <select id="sleep" aria-label="睡眠定时">
+            <option value="0">关</option>
+            <option value="15">15 分钟</option>
+            <option value="30">30 分钟</option>
+            <option value="45">45 分钟</option>
+            <option value="60">60 分钟</option>
+            <option value="90">90 分钟</option>
+            <option value="120">120 分钟</option>
+          </select>
+          <span id="sleepInfo" class="muted"></span>
+        </label>
+      </div>
+      <div class="foot">
+        <button id="refresh" class="link">刷新</button>
+        <span id="msg" class="muted"></span>
+      </div>
+    </div>
+    <div class="browse">
+      <div class="search">
+        <input id="q" placeholder="搜 B站 歌单 / 歌曲" autocomplete="off">
+        <button id="searchBtn">搜索</button>
+      </div>
+      <div class="refreshbar">
+        <span id="refreshInfo">—</span>
+        <button id="pageBtn" class="link">换一批</button>
+        <button id="refreshBtn" class="link">刷新</button>
+      </div>
+      <div id="results"><div class="tab-empty">加载中…</div></div>
+    </div>
   </div>
-  <div class="search">
-    <input id="q" placeholder="搜 B站 歌单 / 歌曲" autocomplete="off">
-    <button id="searchBtn">搜索</button>
-  </div>
-  <div class="refreshbar">
-    <span id="refreshInfo">—</span>
-    <button id="pageBtn" class="link">换一批</button>
-    <button id="refreshBtn" class="link">刷新</button>
-  </div>
-  <div id="results"><div class="tab-empty">加载中…</div></div>
-  <div class="vol">
-    <span id="volIcon" title="系统音量">🔊</span>
-    <input id="vol" type="range" min="0" max="100" step="1" value="30" aria-label="系统音量">
-    <span id="volVal" class="muted">--%</span>
-  </div>
-  <div class="actions">
-    <button id="play" class="btn">▶ 播放</button>
-    <button id="pause" class="btn primary">⏸ 暂停</button>
-  </div>
-  <div class="foot">
-    <button id="refresh" class="link">刷新</button>
-    <span id="msg" class="muted"></span>
-  </div>
-  <div class="note">只允许暂停 / 播放 / 系统音量 / 搜索并播放 B站 视频。固定动作端点，无任意命令、无路径参数。</div>
+  <div class="note">只允许播放/暂停/切歌/静音/进度/音量/睡眠定时/唤醒/搜索并播放 B站 视频。固定动作端点，无任意命令、无路径参数。</div>
 </main>
 <script nonce="__NONCE__">
 const CSRF = "__CSRF__";
 const $ = id => document.getElementById(id);
 let busy = false;
+let sleepDue = 0;
+let seekDur = 0;
+let seekDragging = false;
 function msg(t){ $('msg').textContent = t || ''; }
+function fmtSec(s){ s = Math.max(0, Math.round(Number(s) || 0)); return Math.floor(s/60) + ':' + String(s%60).padStart(2,'0'); }
+function showMute(m){
+  if(m === null || m === undefined) return;
+  $('mute').textContent = m ? '🔇 取消静音' : '🔊 静音';
+}
+function renderProgress(pos, dur){
+  const el = $('seek');
+  seekDur = Number(dur) || 0;
+  if(!seekDur || pos === null || pos === undefined){
+    el.disabled = true;
+    $('posTxt').textContent = '--:-- / --:--';
+    return;
+  }
+  el.max = Math.max(1, Math.round(seekDur));
+  if(!seekDragging){
+    el.value = Math.min(seekDur, Math.max(0, Math.round(pos)));
+    $('posTxt').textContent = fmtSec(pos) + ' / ' + fmtSec(seekDur);
+  }
+  el.disabled = busy;
+}
+function setOffline(pcOff){
+  $('badge').textContent = pcOff ? '电脑离线' : '离线';
+  $('badge').className = 'badge bad';
+  $('wakeBox').classList.toggle('show', pcOff);
+  ['play','pause','prev','next','mute'].forEach(id => { $(id).disabled = true; });
+  $('sleep').disabled = true;
+  $('seek').disabled = true;
+}
 function render(d){
   if(!d.ok){
-    $('badge').textContent = '离线'; $('badge').className = 'badge bad';
-    $('title').textContent = d.error || '桥不可达'; $('app').textContent = '';
+    setOffline(d.pc_online === false);
+    $('title').textContent = d.error || '桥不可达';
+    $('app').textContent = d.pc_online === false ? '点上方按钮尝试唤醒'
+      : (d.pc_online === true ? '电脑在线，等待媒体桥启动' : '');
+    sleepDue = d.sleep_due || 0;
     return;
   }
   const st = d.status || 'unknown';
@@ -400,9 +584,18 @@ function render(d){
   $('badge').textContent = txt; $('badge').className = 'badge ' + cls;
   $('title').textContent = d.title || '未知';
   $('app').textContent = d.app || '';
+  $('wakeBox').classList.remove('show');
   showVol(d.volume);
-  $('pause').disabled = busy || st === 'paused';
-  $('play').disabled = busy || st === 'playing';
+  showMute(d.muted);
+  renderProgress(d.pos, d.dur);
+  sleepDue = d.sleep_due || 0;
+  const offline = d.pc_online === false;
+  $('pause').disabled = busy || offline || st === 'paused';
+  $('play').disabled = busy || offline || st === 'playing';
+  $('prev').disabled = busy || offline;
+  $('next').disabled = busy || offline;
+  $('mute').disabled = busy || offline;
+  $('sleep').disabled = offline;
 }
 async function refresh(){
   try { const r = await fetch('/api/status', {cache:'no-store'}); render(await r.json()); }
@@ -428,7 +621,8 @@ async function act(a){
     const d = await post('/api/' + a);
     if(!d) return;
     if(!d.ok) msg(d.error || '操作失败');
-    else msg(a === 'pause' ? '已暂停' : '已播放');
+    else if(a === 'mute'){ showMute(d.muted); msg(d.muted ? '已静音' : '已取消静音'); }
+    else msg({pause:'已暂停', play:'已播放', next:'下一首', prev:'上一首'}[a] || '已完成');
   } catch(e) { msg('请求失败'); }
   finally { busy = false; setTimeout(refresh, 1500); }
 }
@@ -603,6 +797,67 @@ setInterval(() => {
 document.addEventListener('visibilitychange', () => {
   if(!document.hidden && lastRefresh && Date.now() - lastRefresh >= AUTO_MS) manualRefresh();
 });
+async function sendSeek(){
+  if(!seekDur || busy || $('seek').disabled) return;
+  busy = true; msg('跳转中…');
+  try {
+    const d = await post('/api/seek', 'pos=' + Math.round(Number($('seek').value)));
+    if(!d) return;
+    msg(d.ok ? ('已跳到 ' + fmtSec($('seek').value)) : (d.error || '跳转失败'));
+  } catch(e){ msg('跳转失败'); }
+  finally { busy = false; setTimeout(refresh, 1200); }
+}
+$('seek').addEventListener('pointerdown', () => { seekDragging = true; });
+addEventListener('pointerup', () => { if(seekDragging){ seekDragging = false; sendSeek(); } });
+$('seek').addEventListener('input', () => {
+  $('posTxt').textContent = fmtSec($('seek').value) + ' / ' + fmtSec(seekDur);
+});
+function updateSleepInfo(){
+  const el = $('sleepInfo');
+  if(!el) return;
+  if(!sleepDue){ el.textContent = ''; return; }
+  const remain = Math.round(sleepDue - Date.now() / 1000);
+  if(remain <= 0){ el.textContent = '即将暂停'; return; }
+  const m = Math.floor(remain / 60), s = remain % 60;
+  el.textContent = m ? (m + ' 分 ' + String(s).padStart(2,'0') + ' 秒') : (s + ' 秒');
+}
+setInterval(updateSleepInfo, 1000);
+async function setSleep(min){
+  busy = true; msg('设置睡眠定时…');
+  try {
+    const d = await post('/api/sleep', 'min=' + min);
+    if(!d) return;
+    if(!d.ok){ msg(d.error || '设置失败'); return; }
+    sleepDue = d.due || 0;
+    msg(min > 0 ? ('将在 ' + fmtTime(sleepDue * 1000) + ' 自动暂停') : '已取消睡眠定时');
+  } catch(e){ msg('设置失败'); }
+  finally { busy = false; }
+}
+$('sleep').onchange = () => setSleep(Number($('sleep').value));
+let wakeTimer = null;
+$('wake').onclick = async () => {
+  if(wakeTimer) return;
+  msg('发送唤醒包…');
+  try {
+    const d = await post('/api/wake');
+    if(!d) return;
+    if(!d.ok){ msg(d.error || '唤醒不可用'); return; }
+    msg('已发送，等待电脑启动…');
+    let n = 0;
+    wakeTimer = setInterval(async () => {
+      n++;
+      try {
+        const r = await fetch('/api/pc', {cache:'no-store'});
+        const p = await r.json();
+        if(p.online){ clearInterval(wakeTimer); wakeTimer = null; msg('电脑已上线，正在加载…'); refresh(); }
+        else if(n >= 30){ clearInterval(wakeTimer); wakeTimer = null; msg('唤醒超时：检查网卡/BIOS WoL 设置'); }
+      } catch(e){}
+    }, 3000);
+  } catch(e){ msg('唤醒请求失败'); }
+};
+$('prev').onclick = () => act('prev');
+$('next').onclick = () => act('next');
+$('mute').onclick = () => act('mute');
 $('play').onclick = () => act('play');
 $('pause').onclick = () => act('pause');
 $('refresh').onclick = refresh;
@@ -733,6 +988,11 @@ class Handler(BaseHTTPRequestHandler):
                 return
             open_id = str(data.get("open_id") or "")
             if not open_id or not _allowed_openid(open_id):
+                print(
+                    "[feishu-oauth] denied open_id=%r name=%r"
+                    % (open_id, data.get("name") or data.get("en_name") or ""),
+                    flush=True,
+                )
                 self._send(403, b"not allowed", "text/plain; charset=utf-8")
                 return
             self._send(302, b"", "text/plain; charset=utf-8", {
@@ -767,7 +1027,7 @@ class Handler(BaseHTTPRequestHandler):
             html = PAGE.replace("__NONCE__", nonce).replace("__CSRF__", CSRF)
             self._send(200, html.encode("utf-8"), "text/html; charset=utf-8", nonce=nonce)
             return
-        if path not in ("/", "/index.html", "/api/status", "/api/health",
+        if path not in ("/", "/index.html", "/api/status", "/api/health", "/api/pc",
                         "/api/tabs", "/api/videos", "/api/search"):
             self._json({"ok": False, "error": "not found"}, 404)
             return
@@ -780,6 +1040,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/health":
             self._json({"ok": True})
+            return
+        if path == "/api/pc":
+            self._json({"ok": True, "online": _pc_online(), "wol": bool(WIN_MAC)})
             return
         if path == "/api/tabs":
             force = (parse_qs(parsed.query).get("force") or [""])[0] == "1"
@@ -818,10 +1081,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlsplit(self.path).path
         action = path.rsplit("/", 1)[-1]
-        if path not in ("/api/pause", "/api/play", "/api/volume", "/api/tab", "/api/open"):
+        if path not in ("/api/pause", "/api/play", "/api/next", "/api/prev", "/api/mute",
+                        "/api/volume", "/api/seek", "/api/sleep", "/api/wake",
+                        "/api/tab", "/api/open"):
             self._json({"ok": False, "error": "not found"}, 404)
             return
-        if action not in ("volume", "tab", "open") and action not in ACTIONS:
+        if action not in ("volume", "tab", "open", "seek", "sleep", "wake") and action not in ACTIONS:
             self._json({"ok": False, "error": "not found"}, 404)
             return
         try:
@@ -873,6 +1138,24 @@ class Handler(BaseHTTPRequestHandler):
             if level is None or not 0 <= level <= 100:
                 self._json({"ok": False, "error": "bad level"}, 400)
                 return
+        pos = None
+        if action == "seek":
+            try:
+                pos = float((parse_qs(raw).get("pos") or [""])[0])
+            except ValueError:
+                pos = None
+            if pos is None or not 0 <= pos <= 86400:
+                self._json({"ok": False, "error": "bad pos"}, 400)
+                return
+        minutes = None
+        if action == "sleep":
+            try:
+                minutes = int((parse_qs(raw).get("min") or [""])[0])
+            except ValueError:
+                minutes = None
+            if minutes not in (0, 15, 30, 45, 60, 90, 120):
+                self._json({"ok": False, "error": "bad minutes"}, 400)
+                return
         if not _ACTION_LOCK.acquire(blocking=False):
             self._json({"ok": False, "error": "busy"}, 409)
             return
@@ -901,11 +1184,32 @@ class Handler(BaseHTTPRequestHandler):
                     "volume": data.get("volume"),
                     "error": data.get("error"),
                 })
+            elif action == "seek":
+                data = _bridge("cdp/seek?pos=%.1f" % pos)
+                self._json({
+                    "ok": bool(data.get("ok")),
+                    "action": "seek",
+                    "pos": data.get("pos"),
+                    "error": data.get("error"),
+                })
+            elif action == "sleep":
+                data = _set_sleep(minutes)
+                data["action"] = "sleep"
+                self._json(data)
+            elif action == "wake":
+                data = _wake()
+                self._json({
+                    "ok": bool(data.get("ok")),
+                    "action": "wake",
+                    "sent": data.get("sent"),
+                    "error": data.get("error"),
+                })
             else:
                 data = _bridge(action)
                 self._json({
                     "ok": bool(data.get("ok")),
                     "action": action,
+                    "muted": data.get("muted"),
                     "error": data.get("error"),
                     "session": data.get("session"),
                 })

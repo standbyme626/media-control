@@ -1,7 +1,7 @@
 import asyncio
 import ctypes
-import os
 import json
+import os
 import re
 import time
 import traceback
@@ -9,7 +9,8 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, quote, urlsplit
 
-LOG = os.path.join(os.path.expanduser("~"), "dodaios-bridge.log")
+LOG = os.environ.get("BRIDGE_LOG") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "dodaios-bridge.log")
 
 
 def log(msg):
@@ -23,17 +24,38 @@ def log(msg):
 STATUS = {0: "closed", 1: "opened", 2: "changing", 3: "stopped", 4: "playing", 5: "paused"}
 
 
-def volume(level=None):
+def _endpoint_volume():
     try:
         import comtypes
         comtypes.CoInitialize()
     except Exception:
         pass
     from pycaw.pycaw import AudioUtilities
-    ep = AudioUtilities.GetSpeakers().EndpointVolume
+    return AudioUtilities.GetSpeakers().EndpointVolume
+
+
+def volume(level=None):
+    ep = _endpoint_volume()
     if level is not None:
         ep.SetMasterVolumeLevelScalar(max(0.0, min(1.0, level / 100.0)), None)
     return int(round(ep.GetMasterVolumeLevelScalar() * 100))
+
+
+def muted():
+    try:
+        return bool(_endpoint_volume().GetMute())
+    except Exception:
+        return None
+
+
+def set_mute(toggle=True):
+    try:
+        ep = _endpoint_volume()
+        state = (not bool(ep.GetMute())) if toggle else False
+        ep.SetMute(state, None)
+        return {"ok": True, "muted": state, "volume": volume()}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
 
 
 CDP = "http://127.0.0.1:9222"
@@ -295,7 +317,8 @@ def cdp_status():
     _LAST["id"] = chosen["id"]
     return {"ok": True, "id": chosen["id"], "title": chosen.get("title") or "",
             "url": chosen.get("url") or "", "paused": chosen.get("paused"),
-            "t": chosen.get("t"), "dur": chosen.get("dur"), "volume": volume()}
+            "t": chosen.get("t"), "dur": chosen.get("dur"), "volume": volume(),
+            "muted": muted()}
 
 
 def cdp_activate(tid):
@@ -348,6 +371,36 @@ def cdp_pause():
         except Exception:
             pass
     return {"ok": True, "paused_tabs": n}
+
+
+def cdp_seek(pos):
+    targets = cdp_targets()
+    if not targets:
+        return {"ok": False, "error": "no cdp targets"}
+    target = next((t for t in targets if t.get("id") == _LAST["id"]), None)
+    if target is None:
+        for t in targets:
+            try:
+                info = cdp_eval(t, VIDEO_INFO)
+            except Exception:
+                continue
+            if info and info.get("paused") is False:
+                target = t
+                break
+            if target is None and info:
+                target = t
+    if target is None:
+        target = targets[0]
+    try:
+        val = cdp_eval(target,
+                       "(()=>{const v=document.querySelector('video');if(!v)return null;"
+                       "v.currentTime=%s;return Math.round(v.currentTime)})()" % float(pos))
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    if val is None:
+        return {"ok": False, "error": "no video"}
+    _LAST["id"] = target["id"]
+    return {"ok": True, "pos": val}
 
 
 def _manager_cls():
@@ -495,7 +548,7 @@ class Handler(BaseHTTPRequestHandler):
             elif path in ("list", "now"):
                 sessions, chosen, current_app = asyncio.run(snapshot())
                 body = {"ok": True, "current_app": current_app, "chosen": chosen,
-                        "sessions": sessions, "volume": volume()}
+                        "sessions": sessions, "volume": volume(), "muted": muted()}
             elif path == "tabs":
                 body = {"ok": True, "windows": list_tabs()}
             elif path == "volume":
@@ -524,6 +577,18 @@ class Handler(BaseHTTPRequestHandler):
                 body = cdp_open_bv(bv)
             elif path == "cdp/status":
                 body = cdp_status()
+            elif path == "cdp/seek":
+                q = parse_qs(urlsplit(self.path).query)
+                try:
+                    pos = float((q.get("pos") or ["-1"])[0])
+                except ValueError:
+                    pos = -1
+                if pos < 0 or pos > 86400:
+                    body = {"ok": False, "error": "bad pos"}
+                else:
+                    body = cdp_seek(pos)
+            elif path == "mute":
+                body = set_mute(True)
             elif path == "cdp/pause":
                 body = cdp_pause()
             elif path == "cdp/activate":
@@ -547,9 +612,10 @@ class Handler(BaseHTTPRequestHandler):
                     "endpoints": ["/health", "/list", "/now", "/tabs", "/tab?w=&t=",
                                   "/cdp/list", "/cdp/status", "/cdp/play?id=",
                                   "/cdp/pause", "/cdp/activate?id=",
+                                  "/cdp/seek?pos=",
                                   "/cdp/videos", "/cdp/search?q=&page=",
                                   "/cdp/playlist?url=", "/cdp/open?bv=",
-                                  "/volume?level=0-100",
+                                  "/volume?level=0-100", "/mute",
                                   "/pause", "/play", "/toggle", "/next", "/prev"],
                 }
         except Exception as exc:

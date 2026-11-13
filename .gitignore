@@ -7,3 +7,9 @@ __pycache__/
 .venv/
 venv/
 .DS_Store
+config.properties
+*.apk
+*.idsig
+*.jks
+android/build/
+mc-latest.json
