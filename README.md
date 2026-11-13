@@ -86,7 +86,7 @@ Windows SMTC · 受控 Edge + CDP · B 站搜索直连 · 睡眠定时 · PC 唤
 
 ![界面截图](docs/screenshot.png)
 
-左侧是遥控器（当前播放、进度、上一首/播放/暂停/下一首、静音、睡眠定时），右侧是 B 站搜索结果网格。窄屏自动退回单列，手机竖屏也能用。
+左侧是遥控器（当前播放、进度、上一首/播放/暂停/下一首、静音、睡眠定时），右侧是 B 站搜索结果网格。窄屏自动退回单列，手机竖屏下页面锁定一屏高度（只有结果列表内部滚动），不用上下拉动。
 
 ## 4. 系统架构
 
@@ -199,7 +199,8 @@ systemctl enable --now media-web
 
 - 首次启动读取打包进 assets 的默认配置，自动登录；登录失败才显示预填好的登录页；
 - 右上角菜单：刷新 / 检查更新 / 重新登录；
-- 更新走 OTA：启动时拉取 JSON 清单，比版本号新就下载 APK 并调起安装。
+- 更新走 OTA：启动时拉取 JSON 清单，比版本号新就下载 APK 并调起系统安装器；
+- 首次安装更新时，Android 会由系统安装器请求一次「允许安装未知应用」，授权后后续更新不再进设置。
 
 ### 7.1 打包
 
@@ -221,7 +222,7 @@ systemctl enable --now media-web
 ### 7.2 OTA 清单格式
 
 ```json
-{"version":"1.2","url":"https://your-host/apps/MediaControl-v1.2.apk","notes":"更新说明"}
+{"version":"1.3","url":"https://your-host/apps/MediaControl-v1.3.apk","notes":"更新说明"}
 ```
 
 把清单和 APK 放到任意静态 HTTP 服务上，把清单 URL 填到 `config.properties` 的 `update=`。客户端比较 `versionName`（`major.minor.patch`）后提示更新。建议把 APK 放在不公开列目录的路径，并保持签名一致。
@@ -331,6 +332,7 @@ media-control/
 - [x] 睡眠定时
 - [x] PC 在线检测与 Wake-on-LAN
 - [x] Android 客户端与 OTA
+- [x] 手机一屏布局（结果区内部滚动）
 - [ ] 收藏夹 / 稍后再看（受控 Edge 登录后扩展）
 - [ ] 歌词显示
 - [ ] 飞书卡片按钮直接控制

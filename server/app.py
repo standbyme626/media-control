@@ -449,6 +449,29 @@ h1{font-size:17px;margin:0;font-weight:650;letter-spacing:.2px}
 .body{display:flex;flex-direction:column}
 .controls,.browse{display:contents}
 .track{order:1}.progress{order:3}.search{order:4}.refreshbar{order:5}#results{order:6}.vol{order:7}.actions{order:8}.row2{order:9}.foot{order:10}
+@media (max-width:899px){
+  html,body{height:100%}
+  body{overflow:hidden;align-items:stretch;justify-content:flex-start;padding:8px}
+  .card{width:100%;height:calc(100vh - 16px);height:calc(100dvh - 16px);display:flex;flex-direction:column;padding:14px;border-radius:16px}
+  .head{margin-bottom:12px;gap:10px}
+  .logo{width:38px;height:38px;border-radius:10px;font-size:20px}
+  h1{font-size:16px}
+  .head .muted{font-size:11px}
+  .body{flex:1 1 auto;min-height:0}
+  .track,.climate,.progress,.search,.refreshbar,.vol,.actions,.row2,.foot{flex:none}
+  .track{padding:12px 14px;margin-bottom:8px}
+  .climate{padding:0 2px 8px;gap:12px;font-size:13px}
+  .progress{margin:0 2px 8px}
+  .search{margin-bottom:8px}
+  .refreshbar{margin:0 0 8px}
+  #results{flex:1 1 auto;min-height:120px;max-height:none;margin-bottom:8px}
+  .vol{margin:0 2px 8px}
+  .actions{margin-bottom:8px}
+  .btn{padding:11px 8px;font-size:14px}
+  .actions .btn.small{padding:11px 0;font-size:16px}
+  .row2{margin-bottom:8px}
+  .note{display:none}
+}
 @media (min-width:900px){
   body{align-items:flex-start;padding:26px 18px}
   .card{width:min(94vw,1120px);padding:26px}

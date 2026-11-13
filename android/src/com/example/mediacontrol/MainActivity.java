@@ -9,10 +9,8 @@ import android.content.SharedPreferences;
 import android.database.Cursor;
 import android.graphics.Color;
 import android.net.Uri;
-import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
-import android.provider.Settings;
 import android.text.InputType;
 import android.util.Base64;
 import android.view.Gravity;
@@ -392,21 +390,6 @@ public class MainActivity extends Activity {
     }
 
     void downloadApk(final String url, final String ver) {
-        if (Build.VERSION.SDK_INT >= 26 && !getPackageManager().canRequestPackageInstalls()) {
-            new AlertDialog.Builder(this)
-                    .setTitle("允许安装更新")
-                    .setMessage("首次自动更新需要允许本应用安装 APK。")
-                    .setPositiveButton("去设置", (d, w) -> {
-                        try {
-                            startActivity(new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
-                                    Uri.parse("package:" + getPackageName())));
-                        } catch (Exception ignored) {
-                        }
-                    })
-                    .setNegativeButton("取消", null)
-                    .show();
-            return;
-        }
         try {
             DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
             DownloadManager.Request req = new DownloadManager.Request(Uri.parse(url));
