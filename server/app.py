@@ -523,8 +523,8 @@ h1{font-size:17px;margin:0;font-weight:650;letter-spacing:.2px}
       </div>
       <div class="row2">
         <button id="mute" class="btn mute">🔊 静音</button>
-        <label class="sleep">睡眠
-          <select id="sleep" aria-label="睡眠定时">
+        <label class="sleep">定时暂停
+          <select id="sleep" aria-label="定时暂停">
             <option value="0">关</option>
             <option value="15">15 分钟</option>
             <option value="30">30 分钟</option>
@@ -554,7 +554,7 @@ h1{font-size:17px;margin:0;font-weight:650;letter-spacing:.2px}
       <div id="results"><div class="tab-empty">加载中…</div></div>
     </div>
   </div>
-  <div class="note">只允许播放/暂停/切歌/静音/进度/音量/睡眠定时/唤醒/搜索并播放 B站 视频。固定动作端点，无任意命令、无路径参数。</div>
+  <div class="note">只允许播放/暂停/切歌/静音/进度/音量/定时暂停/唤醒/搜索并播放 B站 视频。固定动作端点，无任意命令、无路径参数。</div>
 </main>
 <script nonce="__NONCE__">
 const CSRF = "__CSRF__";
@@ -846,13 +846,13 @@ function updateSleepInfo(){
 }
 setInterval(updateSleepInfo, 1000);
 async function setSleep(min){
-  busy = true; msg('设置睡眠定时…');
+  busy = true; msg('设置定时暂停…');
   try {
     const d = await post('/api/sleep', 'min=' + min);
     if(!d) return;
     if(!d.ok){ msg(d.error || '设置失败'); return; }
     sleepDue = d.due || 0;
-    msg(min > 0 ? ('将在 ' + fmtTime(sleepDue * 1000) + ' 自动暂停') : '已取消睡眠定时');
+    msg(min > 0 ? ('将在 ' + fmtTime(sleepDue * 1000) + ' 自动暂停') : '已取消定时暂停');
   } catch(e){ msg('设置失败'); }
   finally { busy = false; }
 }

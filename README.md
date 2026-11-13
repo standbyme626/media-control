@@ -4,7 +4,7 @@
 
 **躺在被窝里，用手机控制电脑上的音乐**
 
-Windows SMTC · 受控 Edge + CDP · B 站搜索直连 · 睡眠定时 · PC 唤醒 · Android 客户端 · OTA 更新
+Windows SMTC · 受控 Edge + CDP · B 站搜索直连 · 定时暂停 · PC 唤醒 · Android 客户端 · OTA 更新
 
 ![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python&logoColor=white)
 ![Windows](https://img.shields.io/badge/Windows-SMTC%20%2F%20WinRT-0078D4?logo=windows&logoColor=white)
@@ -73,7 +73,7 @@ Windows SMTC · 受控 Edge + CDP · B 站搜索直连 · 睡眠定时 · PC 唤
 | 系统音量 | pycaw | 调 Windows 主音量，不是单个网页的音量 |
 | 静音 | pycaw | 系统级静音开关，状态随 `/api/status` 返回 |
 | 进度拖动 | CDP `video.currentTime` | 仅受控 Edge 播放时可用，SMTC 模式自动禁用 |
-| 睡眠定时 | 服务端定时器 | 15/30/45/60/90/120 分钟，到点自动暂停 |
+| 定时暂停 | 服务端定时器 | 15/30/45/60/90/120 分钟，到点只暂停音乐，不睡眠电脑 |
 | PC 在线检测 | TCP 22 探活 | 电脑离线时页面快速显示并禁用控制 |
 | PC 唤醒 | Wake-on-LAN | 服务端发 magic packet，需要网卡与 BIOS 支持 |
 | B 站搜索 | 受控 Edge + CDP | 返回封面、标题、UP 主、播放量、弹幕数、时长 |
@@ -86,7 +86,7 @@ Windows SMTC · 受控 Edge + CDP · B 站搜索直连 · 睡眠定时 · PC 唤
 
 ![界面截图](docs/screenshot.png)
 
-左侧是遥控器（当前播放、进度、上一首/播放/暂停/下一首、静音、睡眠定时），右侧是 B 站搜索结果网格。窄屏自动退回单列，手机竖屏下页面锁定一屏高度（只有结果列表内部滚动），不用上下拉动。
+左侧是遥控器（当前播放、进度、上一首/播放/暂停/下一首、静音、定时暂停），右侧是 B 站搜索结果网格。窄屏自动退回单列，手机竖屏下页面锁定一屏高度（只有结果列表内部滚动），不用上下拉动。
 
 ## 4. 系统架构
 
@@ -132,7 +132,7 @@ Web 服务跑在 Linux 服务器上（常开、有反向代理和证书），桥
 
 网页不能传任意命令、任意路径、任意 URL 给服务器。每个动作对应一个写死的分支，参数只接受整数、浮点秒数或 BV 号，从根上杜绝注入。
 
-### 5.4 睡眠定时为什么放在服务端
+### 5.4 定时暂停为什么放在服务端
 
 手机锁屏后，浏览器和 App 都可能被杀掉或进入 Doze；服务端常开，定时器更可靠，而且网页和 Android 客户端共用同一份逻辑。
 
@@ -232,7 +232,7 @@ systemctl enable --now media-web
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/` | 控制页面（Basic / cookie / 飞书登录） |
-| GET | `/api/status` | 曲目、App、播放状态、音量、静音、进度、PC 在线、睡眠定时 |
+| GET | `/api/status` | 曲目、App、播放状态、音量、静音、进度、PC 在线、定时暂停 |
 | GET | `/api/pc` | Windows 是否在线、是否配置了唤醒 |
 | GET | `/api/videos` | 抓当前搜索页的卡片 |
 | GET | `/api/search?q=&page=` | B 站搜索 |
@@ -242,7 +242,7 @@ systemctl enable --now media-web
 | POST | `/api/mute` | 切换系统静音 |
 | POST | `/api/seek?pos=` | 跳转进度（秒，仅 CDP） |
 | POST | `/api/volume?level=` | 系统音量 0–100 |
-| POST | `/api/sleep?min=` | 睡眠定时：0/15/30/45/60/90/120 分钟 |
+| POST | `/api/sleep?min=` | 定时暂停：0/15/30/45/60/90/120 分钟后只暂停音乐 |
 | POST | `/api/wake` | 发送 Wake-on-LAN magic packet |
 | POST | `/api/open?bv=` | 打开并播放指定视频 |
 | POST | `/api/tab?id=` | 切换标签页 |
@@ -295,7 +295,7 @@ systemctl daemon-reload && systemctl enable --now media-web
 | URL 里的 `&` 被 cmd 拆开 | 搜索参数丢失 | 整条 URL 加双引号 |
 | 默认 profile 被禁调试 | Chrome 136+ 静默禁用 CDP | 必须用独立 `--user-data-dir` |
 | SSH 反向隧道 `localhost` 解析 | `Empty reply from server` | Windows 把 localhost 解析成 `::1`，用 `127.0.0.1` |
-| 手机锁屏定时器丢 | 到点没暂停 | 睡眠定时放服务端，不依赖前端存活 |
+| 手机锁屏定时器丢 | 到点没暂停 | 定时暂停放服务端，不依赖前端存活 |
 
 ## 13. 目录结构
 
@@ -320,7 +320,7 @@ media-control/
 ## 14. 安全须知
 
 - 网页只提供固定动作，没有任意命令 / 路径 / URL 执行。
-- 服务端校验全部参数：音量 0–100，进度 0–86400 秒，睡眠 0/15/30/45/60/90/120，BV 号 `^BV[0-9A-Za-z]+$`。
+- 服务端校验全部参数：音量 0–100，进度 0–86400 秒，定时 0/15/30/45/60/90/120，BV 号 `^BV[0-9A-Za-z]+$`。
 - Basic 认证 + 持久化 CSRF + 每 IP 限速 + 单动作锁。
 - 桥与 CDP 只绑 `127.0.0.1`。
 - 仓库不含密码、域名、IP、主机名或个人路径；Android 配置在本地 `config.properties`，已 gitignore。
@@ -329,7 +329,7 @@ media-control/
 ## 15. Roadmap
 
 - [x] 上一首/下一首、静音、进度拖动
-- [x] 睡眠定时
+- [x] 定时暂停（只暂停音乐，不睡眠电脑）
 - [x] PC 在线检测与 Wake-on-LAN
 - [x] Android 客户端与 OTA
 - [x] 手机一屏布局（结果区内部滚动）
