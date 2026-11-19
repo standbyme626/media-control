@@ -1,342 +1,188 @@
-<div align="center">
-
 # media-control
 
-**躺在被窝里，用手机控制电脑上的音乐**
+**躺在沙发上，用手机遥控电脑放歌。** 手机只当遥控器，声音从电脑的音响出来。
 
-Windows SMTC · 受控 Edge + CDP · B 站搜索直连 · 定时暂停 · PC 唤醒 · Android 客户端 · OTA 更新
-
-![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python&logoColor=white)
-![Windows](https://img.shields.io/badge/Windows-SMTC%20%2F%20WinRT-0078D4?logo=windows&logoColor=white)
-![Edge](https://img.shields.io/badge/Edge-CDP-0078D7?logo=microsoftedge&logoColor=white)
-![Linux](https://img.shields.io/badge/Server-Linux%20systemd-FCC624?logo=linux&logoColor=black)
-![Android](https://img.shields.io/badge/Android-WebView-3DDC84?logo=android&logoColor=white)
-![License](https://img.shields.io/badge/License-MIT-green)
-
-[项目概览](#1-项目概览) · [核心特性](#2-核心特性) · [界面](#3-界面) · [系统架构](#4-系统架构) · [快速开始](#6-快速开始) · [Android](#7-android-客户端) · [API](#8-api)
-
-</div>
-
-> **项目定位：家庭局域网的个人工具，不是远程桌面。**
-> 只做「媒体控制」一件事：看现在放什么、暂停/继续、切歌、拖进度、调音量、搜歌点播、定时暂停。
-> 不碰桌面、不抢焦点、不需要把 Windows 解锁到桌面。
-
-**2 个进程** · **零第三方依赖（服务端）** · **10 分钟自动刷新** · **手机网页与 Android 客户端并存**
-
----
-
-## 目录
-
-- [1. 项目概览](#1-项目概览)
-- [2. 核心特性](#2-核心特性)
-- [3. 界面](#3-界面)
-- [4. 系统架构](#4-系统架构)
-- [5. 关键设计](#5-关键设计)
-- [6. 快速开始](#6-快速开始)
-- [7. Android 客户端](#7-android-客户端)
-- [8. API](#8-api)
-- [9. 部署](#9-部署)
-- [10. 测试与验证](#10-测试与验证)
-- [11. 已知限制](#11-已知限制)
-- [12. 工程实践与踩坑](#12-工程实践与踩坑)
-- [13. 目录结构](#13-目录结构)
-- [14. 安全须知](#14-安全须知)
-- [15. Roadmap](#15-roadmap)
-
----
-
-## 1. 项目概览
-
-### 1.1 要解决的问题
-
-晚上躺在床上，电脑在书桌上接着音箱放歌。想切歌、暂停、把音量调小，或者干脆关掉，都得爬起来走到电脑前。
-
-远程桌面太重：要解锁、要看清桌面、要在一堆窗口里点来点去；手机上的远程控制 App 还要装客户端、配对、保持后台。很多时候我只是想「把歌关掉」或者「换一首」，不需要看到整个桌面。
-
-### 1.2 方案
-
-把「放」和「控」拆开：
-
-- **放**：一个专用受控浏览器（Edge，独立 profile）负责打开 B 站并播放；
-- **控**：一个网页（服务器上跑）负责展示状态、发指令；
-- **桥**：Windows 上的小服务，把网页指令翻译成 SMTC / 音量 / CDP 动作；
-- **客户端**：网页直接用；另附一个 Android WebView 壳，带内置登录与 OTA 更新。
-
-手机、平板、另一台电脑，打开浏览器就能用；Android 客户端只是同一页面的原生外壳。
-
-## 2. 核心特性
-
-| 能力 | 实现 | 说明 |
-|---|---|---|
-| 播放 / 暂停 | WinRT SMTC / CDP | 优先控制受控 Edge 的 video，失败回退系统媒体会话 |
-| 上一首 / 下一首 | 系统媒体键（SMTC） | 支持切歌的播放器有效；B 站单视频通常忽略 |
-| 系统音量 | pycaw | 调 Windows 主音量，不是单个网页的音量 |
-| 静音 | pycaw | 系统级静音开关，状态随 `/api/status` 返回 |
-| 进度拖动 | CDP `video.currentTime` | 仅受控 Edge 播放时可用，SMTC 模式自动禁用 |
-| 定时暂停 | 服务端定时器 | 15/30/45/60/90/120 分钟，到点只暂停音乐，不睡眠电脑 |
-| PC 在线检测 | TCP 22 探活 | 电脑离线时页面快速显示并禁用控制 |
-| PC 唤醒 | Wake-on-LAN | 服务端发 magic packet，需要网卡与 BIOS 支持 |
-| B 站搜索 | 受控 Edge + CDP | 返回封面、标题、UP 主、播放量、弹幕数、时长 |
-| 点播 | CDP `Page.navigate` | 在专用播放器标签打开并播放，自动复用标签 |
-| 自动刷新 | 前端 10 分钟定时 | 页面不可见时不刷，回来补刷 |
-| 登录鉴权 | Basic + 飞书 OAuth | 飞书 OAuth 可选，open_id 白名单 |
-| Android 客户端 | WebView + 配置注入 | 首次自动登录，OTA 更新，节省得手输密码 |
-
-## 3. 界面
-
-![界面截图](docs/screenshot.png)
-
-左侧是遥控器（当前播放、进度、上一首/播放/暂停/下一首、静音、定时暂停），右侧是 B 站搜索结果网格。窄屏自动退回单列，手机竖屏下页面锁定一屏高度（只有结果列表内部滚动），不用上下拉动。
-
-## 4. 系统架构
-
-### 4.1 总览
+服务端是 0 依赖的 Python，Windows 侧一个 CDP 桥进程，手机端可以直接用浏览器或用自带的小壳 APK。
+支持 B 站搜索 / 队列连播 / 睡前渐弱 / 锁屏媒体键 / 语音点歌。
 
 ```
-手机浏览器 / Android 客户端
-        │ HTTPS + Basic Auth（Nginx / Tunnel）
-        ▼
-media-web（Linux，Python 标准库，:8097）
-        │ SSH 固定命令（参数白名单）
-        ▼
-Windows Bridge（127.0.0.1:8765）
-        ├─ WinRT SMTC / pycaw（播放、切歌、静音、系统音量）
-        └─ CDP 127.0.0.1:9222（受控 Edge：标签、搜索、点播、进度）
-        ▼
-受控 Edge 播放 → Windows 音频输出 → 音箱
+手机浏览器 或 APK（WebView）
+   │  HTTP(S)
+   ▼
+media-web  :8097        ← 鉴权、CSRF、限流、页面、API
+   │  常驻 SSH 隧道 127.0.0.1:8765
+   ▼
+Windows bridge :8765    ← 多线程 HTTP + Chrome DevTools Protocol
+   │
+   ▼
+Edge（受控实例，--remote-debugging-port=9222）→ B 站播放器
 ```
 
-### 4.2 一次点歌的完整过程
+## 功能
 
-```
-1. 手机输入关键词 → GET /api/search?q=xxx&page=1
-2. media-web 校验参数 → ssh <windows-host> "curl 127.0.0.1:8765/cdp/search?q=..."
-3. 桥通过 CDP 让受控 Edge 打开 B 站搜索页
-4. 桥等待渲染，执行 JS 抓视频卡片 → 返回 JSON
-5. 前端渲染网格；用户点卡片 → POST /api/open?bv=BVxxxx
-6. 桥导航到视频页 → 执行 video.play()
-7. 前端每 5 秒轮询 /api/status 更新进度与状态
-```
-
-## 5. 关键设计
-
-### 5.1 为什么拆成三个进程
-
-Web 服务跑在 Linux 服务器上（常开、有反向代理和证书），桥必须跑在 **Windows 交互桌面会话** 里——UI Automation 和音频控制离开交互会话就用不了，所以桥不能和 Web 服务同机同进程。
-
-### 5.2 为什么用受控 Edge 而不是接口
-
-不保存 B 站 Cookie、不模拟登录，直接在真实浏览器里操作：登录态天然复用，页面改版时改选择器即可，也不会触发风控。
-
-### 5.3 为什么所有动作都是固定端点
-
-网页不能传任意命令、任意路径、任意 URL 给服务器。每个动作对应一个写死的分支，参数只接受整数、浮点秒数或 BV 号，从根上杜绝注入。
-
-### 5.4 定时暂停为什么放在服务端
-
-手机锁屏后，浏览器和 App 都可能被杀掉或进入 Doze；服务端常开，定时器更可靠，而且网页和 Android 客户端共用同一份逻辑。
-
-## 6. 快速开始
-
-### 6.1 组件清单
-
-| 位置 | 组件 | 依赖 |
-|---|---|---|
-| Windows | 受控 Edge | 无（系统自带/安装 Edge） |
-| Windows | `bridge/dodaios-bridge.py` | `websocket-client`、`pycaw`、`pywin32`、`psutil` |
-| Linux | `server/app.py` | 无（Python 标准库） |
-| Linux | systemd + 反向代理 | 可选 |
-| Android | `android/` | JDK 17、Android SDK build-tools + platform 34 |
-
-### 6.2 配置
-
-复制 `config.example.env`，按需填写：
-
-| 变量 | 说明 |
+| 分类 | 能力 |
 |---|---|
-| `MEDIA_WEB_USER` / `MEDIA_WEB_PASSWORD` | 网页 Basic 认证；任一为空时拒绝登录 |
-| `MEDIA_WEB_HOST` / `MEDIA_WEB_PORT` | 监听地址与端口，默认 `127.0.0.1:8097` |
-| `MEDIA_WIN_HOST` | Windows 的 IP 或 SSH 主机别名（探活与 SSH 都用它） |
-| `MEDIA_BRIDGE_URL` | 桥地址，默认 `http://127.0.0.1:8765/` |
-| `MEDIA_WIN_MAC` | Windows 网卡 MAC；用于 Wake-on-LAN，留空则禁用唤醒 |
-| `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | 可选，飞书 OAuth 登录 |
-| `FEISHU_REDIRECT_URI` | 可选，飞书 OAuth 回调地址 |
+| 播放 | 播放 / 暂停 / 上一首 / 下一首 / 拖动进度 / 倍速 0.75–2x |
+| 音量 | **双音量**：视频(bilibili 播放器)音量 与 系统音量 分开调，各带 ±1 微调 |
+| 画面 | 网页全屏、弹幕开关、响度均衡（WebAudio 压限） |
+| 队列 | 设队列 / 加入 / 删除 / 按相关推荐填充 / 合集或分P一键入队 / 开关连播 / 自动续播防抖 |
+| 睡前 | 定时暂停 + 最后 20 秒音量渐弱（到点恢复原音量） |
+| 浏览 | 关键词搜索（音乐区过滤、按播放量/最新排序、翻页）、稍后再看、历史、收藏夹 |
+| 语音 | Windows 本地识别（sherpa-onnx + silero VAD + Vosk 关键词）：唤醒词、"下一首"、"放一首 XX"，说话时自动压低音乐 |
+| 锁屏 | Android 壳 1.9+ 提供系统媒体会话：锁屏 / 通知栏 / 蓝牙耳机按键都能 上/下一首、播放/暂停 |
+| 其他 | 局域网内可唤醒电脑（WOL）、可选温湿度卡片、飞书扫码登录、一次性 H5 链接 |
 
-### 6.3 三步启动
+## 快速开始
 
-**第一步：Windows 侧起桥**
+### 1. Windows 侧：受控浏览器 + 桥
 
 ```bat
-pip install websocket-client pycaw pywin32 psutil
-python dodaios-bridge.py
-curl http://127.0.0.1:8765/health
+:: 用独立 profile 起 Edge，开着调试端口
+start "" "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" ^
+  --remote-debugging-port=9222 --remote-allow-origins=* ^
+  --user-data-dir=%USERPROFILE%\edge-music --no-first-run ^
+  --new-window "https://www.bilibili.com/"
 ```
-
-建议用计划任务在登录时启动，勾选「只在用户登录时运行」。
-
-**第二步：Windows 侧起受控 Edge**
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File register-music-edge.ps1
+# 依赖：python 3.9+，pip install websocket-client pycaw comtypes sounddevice vosk sherpa-onnx
+# 常驻：注册计划任务，登录即启动（相当于 Windows 的 systemd）
+schtasks /Create /TN DodaiosBridge /SC ONLOGON ^
+  /TR "pythonw C:\path\to\dodaios-bridge.py" /RL LIMITED /F
 ```
 
-它会用独立 profile（`%USERPROFILE%\edge-music`）启动 Edge，CDP 只绑 `127.0.0.1:9222`。B 站登录可选。
+桥只监听 `127.0.0.1:8765`，不对外暴露。Linux 侧用 SSH 隧道把它接过来：
 
-**第三步：Linux 侧起网页**
+```ini
+# /etc/systemd/system/winpc-bridge-tunnel.service
+[Service]
+ExecStart=/usr/bin/ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \
+          -L 127.0.0.1:8765:127.0.0.1:8765 winpc
+Restart=always
+```
+
+### 2. Linux 侧：media-web
 
 ```bash
-mkdir -p /opt/media-web
-cp server/app.py /opt/media-web/
-cp config.example.env /etc/media-web.env   # chmod 600
-systemctl enable --now media-web
+sudo install -Dm644 server/app.py /opt/media-web/app.py
+sudo install -Dm600 bridge/dodaios-bridge.py /opt/media-web/bridge/dodaios-bridge.py
+
+sudo tee /etc/media-web.env >/dev/null <<'EOF'
+MEDIA_WEB_USER=media
+MEDIA_WEB_PASSWORD=换成你的密码
+MEDIA_WIN_HOST=192.168.1.20      # 电脑的局域网 IP，用于在线探测 + WOL
+MEDIA_WIN_MAC=aa:bb:cc:dd:ee:ff
+EOF
+sudo chmod 600 /etc/media-web.env
+
+sudo cp deploy/media-web.service /etc/systemd/system/
+sudo systemctl enable --now media-web
 ```
 
-浏览器打开 `http://服务器IP:8097/`。
+打开 `http://<服务器IP>:8097/`，用上面那组账号密码登录即可。
 
-## 7. Android 客户端
+**没有配置 `MEDIA_WEB_PASSWORD` 时服务会拒绝所有请求**（fail closed），不会出现"空密码后台"。
 
-`android/` 是一个不带第三方库的 WebView 壳：
+### 3. 手机端
 
-- 首次启动读取打包进 assets 的默认配置，自动登录；登录失败才显示预填好的登录页；
-- 右上角菜单：刷新 / 检查更新 / 重新登录；
-- 更新走 OTA：启动时拉取 JSON 清单，比版本号新就下载 APK 并调起系统安装器；
-- 首次安装更新时，Android 会由系统安装器请求一次「允许安装未知应用」，授权后后续更新不再进设置。
+- 直接浏览器访问（加桌面快捷方式也行）；
+- 或编译自带壳：`cd android && cp config.example.properties config.properties`（填地址和账号）`SDK=~/android-sdk ./build.sh`，得到 `MediaControl-vX.Y.apk`。壳会优先探测局域网地址，不行再走公网；支持锁屏媒体键和自更新。
 
-### 7.1 打包
+## 配置项
 
-1. 复制配置（**不要提交**）：
-   ```bash
-   cd android
-   cp config.example.properties config.properties
-   # 编辑 base / user / pass / update
-   ```
-2. 打包：
-   ```bash
-   SDK=$HOME/Android/Sdk ./build.sh
-   # 产物 MediaControl-v<versionName>.apk
-   ```
-3. `config.properties` 只在构建时注入 APK 的 `assets/defaults.properties`，源码里没有账号密码。
+### media-web（`/etc/media-web.env`）
 
-> 签名密钥 `keystore.jks` 默认生成在 `android/` 下，已被 gitignore。**务必自己备份**：换签名后无法覆盖安装，只能卸载重装。
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `MEDIA_WEB_HOST` / `MEDIA_WEB_PORT` | `0.0.0.0` / `8097` | 监听地址 |
+| `MEDIA_WEB_USER` / `MEDIA_WEB_PASSWORD` | `media` / 空 | Basic 认证；密码为空则整体拒服务 |
+| `MEDIA_BRIDGE_URL` | `http://127.0.0.1:8765/` | 桥地址（走隧道） |
+| `MEDIA_BRIDGE_SSH` | `1` | 隧道挂了时是否退回 `ssh winpc curl` 兜底 |
+| `MEDIA_SSH_TARGET` / `MEDIA_SSH_PORT` | `winpc` / `22` | 兜底用的 SSH 目标与在线探测端口 |
+| `MEDIA_WIN_HOST` / `MEDIA_WIN_MAC` | 空 | 在线探测（TCP）+ 唤醒（WOL） |
+| `MEDIA_STATUS_TTL` | `0.8` | `/api/status` 缓存秒数（多端轮询共享） |
+| `MEDIA_FAIL_MAX` / `MEDIA_FAIL_WINDOW` / `MEDIA_LOCK_SECONDS` | `5` / `600` / `900` | 登录失败锁定策略 |
+| `MEDIA_TRUST_PROXY` | `1` | 只在本机来源时信任 `CF-Connecting-IP` |
+| `MEDIA_PUBLIC_URL` | 空 | 对外地址，用于语音页回调 |
+| `FEISHU_APP_ID` / `FEISHU_APP_SECRET` / `FEISHU_REDIRECT_URI` | 空 | 飞书 OAuth 登录（可不用） |
+| `MEDIA_FEISHU_OPENIDS` | 空 | 飞书白名单；留空时退化为"首次登录绑定" |
+| `MEDIA_H5_TOKEN_FILE` | `/etc/media-web-h5.token` | 一次性链接 token |
+| `MEDIA_CLIMATE_HOST` / `MEDIA_CLIMATE_CMD` | 空 | 可选温湿度卡片，不配就不启用 |
 
-### 7.2 OTA 清单格式
+### bridge（Windows）
 
-```json
-{"version":"1.3","url":"https://your-host/apps/MediaControl-v1.3.apk","notes":"更新说明"}
-```
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `MEDIA_HOME` | `%USERPROFILE%` | 状态/日志/模型的基础目录 |
+| `BRIDGE_PORT` | `8765` | 监听端口（只绑 127.0.0.1） |
+| `BRIDGE_CDP` | `http://127.0.0.1:9222` | 受控浏览器的调试端点 |
+| `BRIDGE_STATE` | `%USERPROFILE%\media-state.json` | 队列/进度/倍速持久化 |
+| `BRIDGE_STATUS_TTL` | `0.8` | 状态快照缓存秒数 |
+| `BRIDGE_VOICE_DIR` / `BRIDGE_VAD_MODEL` / `BRIDGE_VOSK_DIR` | 见代码默认 | 语音模型目录 |
+| `BRIDGE_LOG` | `%USERPROFILE%\dodaios-bridge.log` | 日志 |
 
-把清单和 APK 放到任意静态 HTTP 服务上，把清单 URL 填到 `config.properties` 的 `update=`。客户端比较 `versionName`（`major.minor.patch`）后提示更新。建议把 APK 放在不公开列目录的路径，并保持签名一致。
+## HTTP API
 
-## 8. API
+除 `/feishu*`、`/h5*` 外都要求认证；写操作还要带页面下发的 `X-CSRF-Token`。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/` | 控制页面（Basic / cookie / 飞书登录） |
-| GET | `/api/status` | 曲目、App、播放状态、音量、静音、进度、PC 在线、定时暂停 |
-| GET | `/api/pc` | Windows 是否在线、是否配置了唤醒 |
-| GET | `/api/videos` | 抓当前搜索页的卡片 |
-| GET | `/api/search?q=&page=` | B 站搜索 |
-| GET | `/api/tabs` | 浏览器标签页（兜底） |
-| POST | `/api/pause` / `/api/play` | 暂停 / 播放 |
-| POST | `/api/next` / `/api/prev` | 上一首 / 下一首（系统媒体键） |
-| POST | `/api/mute` | 切换系统静音 |
-| POST | `/api/seek?pos=` | 跳转进度（秒，仅 CDP） |
-| POST | `/api/volume?level=` | 系统音量 0–100 |
-| POST | `/api/sleep?min=` | 定时暂停：0/15/30/45/60/90/120 分钟后只暂停音乐 |
-| POST | `/api/wake` | 发送 Wake-on-LAN magic packet |
-| POST | `/api/open?bv=` | 打开并播放指定视频 |
-| POST | `/api/tab?id=` | 切换标签页 |
+| GET | `/` `/voice` | 控制页 / 语音页 |
+| GET | `/api/health` | 版本、运行时长（用于部署健康检查） |
+| GET | `/api/status` | 播放状态（标题、进度、双音量、队列、原因码），带 0.8s 缓存 |
+| GET | `/api/pc` | 电脑是否在线、能否唤醒 |
+| GET | `/api/tabs` `/api/videos` | 受控浏览器的标签页 / 当前页视频卡片 |
+| GET | `/api/search?q=&page=&music=1&order=` | 搜索 |
+| GET | `/api/queue/status`、`/api/bili/{watchlater,history,favs,fav}` | 队列与 B 站个人列表 |
+| POST | `/api/{play,pause,next,prev,mute,volume,seek,speed,vvol,view,danmaku,eq}` | 播放控制 |
+| POST | `/api/{queue/set,queue/add,queue/del,queue/fill,queue/collection,queue/next,queue/prev,queue/auto}` | 队列 |
+| POST | `/api/{sleep,wake,tab,open}` | 定时暂停 / 唤醒 / 切标签 / 按 BV 打开 |
+| POST | `/api/voice/{test,ack,on,audio}` | 语音 |
 
-所有 POST 需要 `X-CSRF-Token` 头（页面内注入），并受每 IP 限速与单动作锁保护。
+失败响应统一 `{"ok": false, "reason": "...", "error": "..."}`，`reason` ∈ `offline` / `bridge_down` / `no_player`，前端据此给不同提示。
 
-## 9. 部署
+## 安全模型
+
+- **鉴权三条路**：Basic（公网走 TLS 反代）、飞书 OAuth、H5 一次性 token，后两者签发 HMAC Cookie。
+- **先鉴权再读 body**：未认证请求不会让服务端读请求体（大文件上传接口尤其重要）。
+- **CSRF**：写操作必须带页面 nonce 注入的 `X-CSRF-Token`。
+- **限流与锁定**：分 IP 令牌桶 60 req/min；同一 IP 10 分钟内口令错 5 次锁 15 分钟。
+- **真实 IP**：反代后从 `CF-Connecting-IP` 取，且只在来源是本机时信任该头。
+- **CSP**：`default-src 'none'` + 每请求 nonce，禁止内联脚本、外链脚本、iframe。
+- **无命令注入面**：端点白名单 + argv 直传，进 shell 的唯一位置是 SSH 兜底，且只传 `shlex.quote` 后的 URL。
+- **桥不对外**：Windows 桥只绑 127.0.0.1，靠 SSH 隧道接入。
+
+## 目录结构
+
+```
+server/app.py              media-web：HTTP 服务 + 内嵌页面（生成了 nonce/CSRF 注入）
+bridge/dodaios-bridge.py   Windows 桥：CDP、队列、语音、媒体键
+android/                   手机壳（WebView + 媒体会话前台服务）
+deploy/                    systemd unit、部署脚本、Windows 开机自启脚本
+tests/                     pytest：假桥 + 纯函数 + 鉴权/限流/缓存行为
+```
+
+## 开发与测试
 
 ```bash
-# 1. systemd 服务
-cp deploy/media-web.service /etc/systemd/system/
-systemctl daemon-reload && systemctl enable --now media-web
-
-# 2. 反向代理（示例：Caddy）
-# media.example.com {
-#     reverse_proxy 127.0.0.1:8097
-# }
+python3 -m pytest tests -q          # 22 项：服务端行为 + 桥纯函数
+./deploy/deploy.sh                 # 同步到 /opt/media-web → 重启 → 健康检查
 ```
 
-**不要把 8765 / 9222 暴露到公网。**
+不需要 Windows 也能跑测试：桥里的网络/声卡依赖都是函数内延迟导入，假桥用标准库 HTTP 服务模拟。
 
-## 10. 测试与验证
+## 已知限制
 
-| 检查 | 方法 |
-|---|---|
-| 桥存活 | `curl http://127.0.0.1:8765/health` |
-| CDP 可用 | `curl http://127.0.0.1:9222/json/version` |
-| 反代与鉴权 | 未认证访问应返回 401 |
-| 播放链路 | 网页点「播放」，观察 Windows 媒体会话变化 |
-| 进度/静音 | 播放 B 站视频后拖进度条、点静音，看状态是否跟随 |
-| PC 唤醒 | 电脑睡眠后点「唤醒电脑」；失败先查网卡 WoL 与 BIOS |
+- 只是"遥控器"，音频走电脑音响；手机本身不出声。
+- 播放依赖受控浏览器里登录的 B 站账号（会员内容需要会员）。
+- 语音识别跑在 Windows 本机，需要麦克风；USB 麦克风热插拔后要重启桥。
+- 队列按 BV + 分P 去重，跨 P 的合集识别依赖 B 站页面结构，改版可能失效。
 
-## 11. 已知限制
+## 版本记录
 
-- Windows 必须开机且用户已登录，桥不在时无法控制。
-- 受控 Edge 必须运行；CDP 挂了搜索和点播就没法用。
-- 系统音量与静音是全局的，会同时影响电脑上其他声音。
-- 「上一首/下一首」依赖播放器响应系统媒体键；B 站单视频通常无效。
-- 进度拖动只在 CDP 后端可用（SMTC 模式没有进度）。
-- 唤醒成功率取决于网卡驱动、BIOS（ErP / Power On by PCIe）与电源状态；部分网卡在 Windows 里不暴露 WoL 选项。
-- B 站页面结构会变，列表变空时需要更新选择器。
-- 同一关键词短时间刷新通常还是同一批结果，用「换一批」翻页看更多。
-
-## 12. 工程实践与踩坑
-
-| 坑 | 现象 | 处理 |
-|---|---|---|
-| UI Automation 读不到 | SSH 里直接跑 bridge 拿不到媒体信息 | 桥必须跑在 **session 1 交互会话**里 |
-| CSRF 每次重启失效 | 页面按钮全 403 | token 持久化到文件，前端遇 403 自动刷新 |
-| URL 里的 `&` 被 cmd 拆开 | 搜索参数丢失 | 整条 URL 加双引号 |
-| 默认 profile 被禁调试 | Chrome 136+ 静默禁用 CDP | 必须用独立 `--user-data-dir` |
-| SSH 反向隧道 `localhost` 解析 | `Empty reply from server` | Windows 把 localhost 解析成 `::1`，用 `127.0.0.1` |
-| 手机锁屏定时器丢 | 到点没暂停 | 定时暂停放服务端，不依赖前端存活 |
-
-## 13. 目录结构
-
-```
-media-control/
-├── server/app.py                 # 网页 + API（Linux）
-├── bridge/dodaios-bridge.py      # Windows 桥（SMTC / 音量 / CDP）
-├── android/
-│   ├── AndroidManifest.xml
-│   ├── build.sh
-│   ├── config.example.properties
-│   └── src/com/example/mediacontrol/MainActivity.java
-├── deploy/
-│   ├── media-web.service         # systemd 模板
-│   ├── start-music-edge.bat      # 受控 Edge 启动模板
-│   └── register-music-edge.ps1   # 计划任务模板
-├── config.example.env
-├── docs/screenshot.png
-└── README.md
-```
-
-## 14. 安全须知
-
-- 网页只提供固定动作，没有任意命令 / 路径 / URL 执行。
-- 服务端校验全部参数：音量 0–100，进度 0–86400 秒，定时 0/15/30/45/60/90/120，BV 号 `^BV[0-9A-Za-z]+$`。
-- Basic 认证 + 持久化 CSRF + 每 IP 限速 + 单动作锁。
-- 桥与 CDP 只绑 `127.0.0.1`。
-- 仓库不含密码、域名、IP、主机名或个人路径；Android 配置在本地 `config.properties`，已 gitignore。
-- 家庭场景请优先 VPN / Tailscale / Cloudflare Access。
-
-## 15. Roadmap
-
-- [x] 上一首/下一首、静音、进度拖动
-- [x] 定时暂停（只暂停音乐，不睡眠电脑）
-- [x] PC 在线检测与 Wake-on-LAN
-- [x] Android 客户端与 OTA
-- [x] 手机一屏布局（结果区内部滚动）
-- [ ] 收藏夹 / 稍后再看（受控 Edge 登录后扩展）
-- [ ] 歌词显示
-- [ ] 飞书卡片按钮直接控制
-- [ ] macOS 版本（已完成：[media-control-mac](https://github.com/standbyme626/media-control-mac)）
+- **3.5.0**（2026-11-19）：桥改多线程 + 状态快照缓存；`/api/status` 0.8s 缓存；进度条本地外推；轮询自适应；登录失败锁定、真实 IP、先鉴权后读 body、HSTS；搜索/播放改用专属标签页；状态原子落盘；APK 1.9 加入锁屏媒体会话；补 22 项测试与部署脚本。
+- **3.4.x**：B 站控制增强（双音量/队列连播/倍速/续播/全屏/弹幕/收藏夹）、本地语音识别。
+- **3.3.0**：多源元数据、发现页。
 
 ## License
 

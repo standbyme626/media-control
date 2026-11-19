@@ -1,20 +1,31 @@
-package com.example.mediacontrol;
+package com.dsh.mediacontrol;
 
+import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.DownloadManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.graphics.Color;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.text.InputType;
 import android.util.Base64;
 import android.view.Gravity;
+import android.view.View;
+import android.view.ViewGroup;
+import android.view.ViewParent;
 import android.webkit.HttpAuthHandler;
+import android.webkit.JavascriptInterface;
+import android.webkit.PermissionRequest;
 import android.webkit.WebChromeClient;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
@@ -23,11 +34,13 @@ import android.widget.Button;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
+import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
 import org.json.JSONObject;
+import org.json.JSONTokener;
 
 import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
@@ -37,14 +50,17 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 
 public class MainActivity extends Activity {
+    static final int REQ_NOTIF = 9;
     static final String DEFAULT_BASE = "";
     static final String DEFAULT_UPDATE = "";
     static final String PREFS = "mediacontrol";
 
     SharedPreferences sp;
     WebView webView;
-    String base, user, pass;
-    String defBase = DEFAULT_BASE, defUser = "", defPass = "", updateUrl = DEFAULT_UPDATE;
+    View splashOverlay;
+    boolean updateScheduled = false;
+    String publicBase, lanBase, base, user, pass;
+    String defBase = DEFAULT_BASE, defLan = "", defUser = "", defPass = "", updateUrl = DEFAULT_UPDATE;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -52,17 +68,18 @@ public class MainActivity extends Activity {
         readDefaults();
         sp = getSharedPreferences(PREFS, MODE_PRIVATE);
         boolean saved = sp.contains("user") && sp.contains("pass");
-        base = normalize(sp.getString("base", defBase));
+        publicBase = normalize(sp.getString("base", defBase));
+        lanBase = normalizeLan(sp.getString("lan", defLan));
         user = sp.getString("user", defUser);
         pass = sp.getString("pass", defPass);
+        base = publicBase;
         if (user.isEmpty() || pass.isEmpty()) {
             showLogin("请输入访问账号");
         } else if (saved) {
-            showWeb();
+            startWithBestBase();
         } else {
             autoLogin();
         }
-        getWindow().getDecorView().postDelayed(() -> checkUpdate(false), 3500);
     }
 
     void readDefaults() {
@@ -77,6 +94,7 @@ public class MainActivity extends Activity {
                 String k = line.substring(0, i).trim();
                 String v = line.substring(i + 1).trim();
                 if (k.equals("base")) defBase = v;
+                else if (k.equals("lan")) defLan = v;
                 else if (k.equals("user")) defUser = v;
                 else if (k.equals("pass")) defPass = v;
                 else if (k.equals("update")) updateUrl = v;
@@ -86,21 +104,72 @@ public class MainActivity extends Activity {
         if (defBase.isEmpty()) defBase = DEFAULT_BASE;
     }
 
-    void autoLogin() {
-        TextView tv = new TextView(this);
-        tv.setText("正在连接…");
-        tv.setTextColor(0xFF9AA4AE);
-        tv.setTextSize(16);
-        tv.setGravity(Gravity.CENTER);
-        FrameLayout f = new FrameLayout(this);
-        f.setBackgroundColor(0xFF101418);
-        f.addView(tv, new FrameLayout.LayoutParams(-1, -1, Gravity.CENTER));
-        setContentView(f);
+    void startWithBestBase() {
+        showSplash();
         new Thread(() -> {
-            final int code = verify(base, user, pass);
+            final String chosen = chooseBase();
+            runOnUiThread(() -> {
+                base = chosen;
+                showWeb();
+            });
+        }, "choose-base").start();
+    }
+
+    String chooseBase() {
+        String pub = publicBase;
+        if (isWifi() && !lanBase.isEmpty()) {
+            int code = probe(lanBase);
+            if (code == 200 || code == 401) {
+                sp.edit().putString("active_base", lanBase).apply();
+                return lanBase;
+            }
+        }
+        sp.edit().putString("active_base", pub).apply();
+        return pub;
+    }
+
+    boolean isWifi() {
+        try {
+            ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm == null) return false;
+            Network n = cm.getActiveNetwork();
+            if (n == null) return false;
+            NetworkCapabilities caps = cm.getNetworkCapabilities(n);
+            return caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    int probe(String baseUrl) {
+        if (baseUrl == null || baseUrl.isEmpty()) return -1;
+        HttpURLConnection c = null;
+        try {
+            c = (HttpURLConnection) new URL(baseUrl + "api/health").openConnection();
+            c.setConnectTimeout(800);
+            c.setReadTimeout(800);
+            c.setRequestProperty("Accept", "application/json");
+            if (!user.isEmpty() && !pass.isEmpty()) {
+                c.setRequestProperty("Authorization", basic(user, pass));
+            }
+            return c.getResponseCode();
+        } catch (Exception e) {
+            return -1;
+        } finally {
+            if (c != null) c.disconnect();
+        }
+    }
+
+    void autoLogin() {
+        showSplash();
+        new Thread(() -> {
+            final String chosen = chooseBase();
+            final int code = verify(chosen, user, pass);
             runOnUiThread(() -> {
                 if (code == 200) {
-                    sp.edit().putString("base", base).putString("user", user).putString("pass", pass).apply();
+                    base = chosen;
+                    sp.edit().putString("base", publicBase).putString("user", user).putString("pass", pass)
+                            .putString("active_base", chosen).apply();
                     showWeb();
                 } else if (code == 401) {
                     showLogin("默认密码已失效，请重新输入");
@@ -116,7 +185,7 @@ public class MainActivity extends Activity {
         if (webView != null && webView.canGoBack()) {
             webView.goBack();
         } else {
-            super.onBackPressed();
+            moveTaskToBack(true);
         }
     }
 
@@ -129,6 +198,14 @@ public class MainActivity extends Activity {
         return u;
     }
 
+    static String normalizeLan(String u) {
+        u = u == null ? "" : u.trim();
+        if (u.isEmpty()) return "";
+        if (!u.startsWith("http://") && !u.startsWith("https://")) u = "http://" + u;
+        if (!u.endsWith("/")) u += "/";
+        return u;
+    }
+
     int dp(int n) {
         return (int) (getResources().getDisplayMetrics().density * n);
     }
@@ -137,6 +214,55 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(w, h);
         p.topMargin = top;
         return p;
+    }
+
+    void showSplash() {
+        FrameLayout f = new FrameLayout(this);
+        f.setBackgroundColor(0xFF101418);
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setGravity(Gravity.CENTER);
+        int pad = dp(28);
+        box.setPadding(pad, pad, pad, pad);
+
+        TextView title = new TextView(this);
+        title.setText("媒体遥控");
+        title.setTextColor(Color.WHITE);
+        title.setTextSize(24);
+        title.setGravity(Gravity.CENTER);
+        box.addView(title, new LinearLayout.LayoutParams(-1, -2));
+
+        String last = sp.getString("last_title", "");
+        TextView sub = new TextView(this);
+        sub.setText("正在连接…");
+        sub.setTextColor(0xFF9AA4AE);
+        sub.setTextSize(13);
+        sub.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams sp1 = new LinearLayout.LayoutParams(-1, -2);
+        sp1.topMargin = dp(10);
+        box.addView(sub, sp1);
+
+        if (!last.isEmpty() && !last.equals("—")) {
+            TextView lastView = new TextView(this);
+            lastView.setText("上次播放：" + last);
+            lastView.setTextColor(0xFF6F8092);
+            lastView.setTextSize(12);
+            lastView.setGravity(Gravity.CENTER);
+            lastView.setMaxLines(2);
+            LinearLayout.LayoutParams sp2 = new LinearLayout.LayoutParams(-1, -2);
+            sp2.topMargin = dp(14);
+            box.addView(lastView, sp2);
+        }
+
+        ProgressBar pb = new ProgressBar(this);
+        pb.setIndeterminate(true);
+        LinearLayout.LayoutParams sp3 = new LinearLayout.LayoutParams(dp(28), dp(28));
+        sp3.topMargin = dp(18);
+        sp3.gravity = Gravity.CENTER_HORIZONTAL;
+        box.addView(pb, sp3);
+
+        f.addView(box, new FrameLayout.LayoutParams(-1, -1, Gravity.CENTER));
+        setContentView(f);
     }
 
     void showLogin(String msg) {
@@ -163,7 +289,7 @@ public class MainActivity extends Activity {
 
         final String fillUser = user.isEmpty() ? (defUser.isEmpty() ? "media" : defUser) : user;
         final String fillPass = pass.isEmpty() ? defPass : pass;
-        final EditText etBase = field("服务器地址", base, InputType.TYPE_TEXT_VARIATION_URI);
+        final EditText etBase = field("服务器地址", publicBase.isEmpty() ? base : publicBase, InputType.TYPE_TEXT_VARIATION_URI);
         final EditText etUser = field("账号", fillUser, InputType.TYPE_CLASS_TEXT);
         final EditText etPass = field("密码", fillPass, InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
         box.addView(etBase, lp(-1, -2, dp(28)));
@@ -195,9 +321,11 @@ public class MainActivity extends Activity {
                     btn.setText("登 录");
                     if (code == 200) {
                         base = b;
+                        publicBase = b.startsWith("https://") ? b : normalize(defBase);
                         user = u;
                         pass = p;
-                        sp.edit().putString("base", b).putString("user", u).putString("pass", p).apply();
+                        sp.edit().putString("base", publicBase).putString("user", u).putString("pass", p)
+                                .putString("active_base", b).apply();
                         showWeb();
                     } else if (code == 401) {
                         Toast.makeText(this, "账号或密码错误", Toast.LENGTH_SHORT).show();
@@ -251,6 +379,11 @@ public class MainActivity extends Activity {
         s.setDomStorageEnabled(true);
         s.setMediaPlaybackRequiresUserGesture(false);
         webView.setBackgroundColor(0xFF101418);
+        // 网页 -> 原生：上报当前曲目/播放状态，供系统媒体会话与通知栏使用
+        webView.addJavascriptInterface(new MediaBridge(), "AndroidMedia");
+        MediaService.listener = this::onMediaAction;
+        ensureNotificationPermission();
+        MediaService.touch(this, "", false);
         webView.setWebViewClient(new WebViewClient() {
             @Override
             public void onReceivedHttpAuthRequest(WebView view, HttpAuthHandler handler, String host, String realm) {
@@ -266,9 +399,44 @@ public class MainActivity extends Activity {
                 }
                 return true;
             }
+
+            @Override
+            public void onPageCommitVisible(WebView view, String url) {
+                hideSplash();
+                scheduleUpdateCheck(view);
+                view.postDelayed(() -> captureTitle(view), 2500);
+            }
+
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                hideSplash();
+                scheduleUpdateCheck(view);
+                view.postDelayed(() -> captureTitle(view), 2500);
+            }
+
+            @Override
+            public void onReceivedError(WebView view, int errorCode, String description, String failingUrl) {
+                hideSplash();
+            }
         });
-        webView.setWebChromeClient(new WebChromeClient());
+        webView.setWebChromeClient(new WebChromeClient() {
+            @Override
+            public void onPermissionRequest(final PermissionRequest request) {
+                runOnUiThread(() -> {
+                    for (String res : request.getResources()) {
+                        if (PermissionRequest.RESOURCE_AUDIO_CAPTURE.equals(res) &&
+                                checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                            request.grant(new String[]{res});
+                            return;
+                        }
+                    }
+                    request.deny();
+                });
+            }
+        });
         root.addView(webView, new FrameLayout.LayoutParams(-1, -1));
+        root.addView(buildLoadingOverlay(), new FrameLayout.LayoutParams(-1, -1));
+        root.postDelayed(this::hideSplash, 8000);
 
         TextView menu = new TextView(this);
         menu.setText("⋮");
@@ -286,18 +454,159 @@ public class MainActivity extends Activity {
         webView.loadUrl(base);
     }
 
+    View buildLoadingOverlay() {
+        FrameLayout overlay = new FrameLayout(this);
+        overlay.setBackgroundColor(0xFF101418);
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setGravity(Gravity.CENTER);
+        TextView title = new TextView(this);
+        title.setText("媒体遥控");
+        title.setTextColor(Color.WHITE);
+        title.setTextSize(22);
+        title.setGravity(Gravity.CENTER);
+        box.addView(title);
+        TextView sub = new TextView(this);
+        sub.setText("正在连接…");
+        sub.setTextColor(0xFF9AA4AE);
+        sub.setTextSize(13);
+        sub.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams p1 = new LinearLayout.LayoutParams(-1, -2);
+        p1.topMargin = dp(8);
+        box.addView(sub, p1);
+        ProgressBar pb = new ProgressBar(this);
+        pb.setIndeterminate(true);
+        LinearLayout.LayoutParams p2 = new LinearLayout.LayoutParams(dp(26), dp(26));
+        p2.topMargin = dp(14);
+        p2.gravity = Gravity.CENTER_HORIZONTAL;
+        box.addView(pb, p2);
+        overlay.addView(box, new FrameLayout.LayoutParams(-1, -1, Gravity.CENTER));
+        splashOverlay = overlay;
+        return overlay;
+    }
+
+    void hideSplash() {
+        final View v = splashOverlay;
+        if (v == null) return;
+        splashOverlay = null;
+        v.animate().alpha(0f).setDuration(200).withEndAction(() -> {
+            ViewParent p = v.getParent();
+            if (p instanceof ViewGroup) ((ViewGroup) p).removeView(v);
+        });
+    }
+
+    void scheduleUpdateCheck(View view) {
+        if (updateScheduled) return;
+        updateScheduled = true;
+        view.postDelayed(() -> checkUpdate(false), 3000);
+    }
+
+    /** 系统媒体按键（锁屏/通知栏/耳机）-> 网页 */
+    void onMediaAction(final String action) {
+        final WebView w = webView;
+        if (w == null) return;
+        runOnUiThread(() -> {
+            String js = "window.mcMediaAction&&window.mcMediaAction('" + action.replace("'", "") + "')";
+            try {
+                w.evaluateJavascript(js, null);
+            } catch (Exception ignored) {
+            }
+        });
+    }
+
+    void ensureNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
+            try {
+                requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, REQ_NOTIF);
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    public class MediaBridge {
+        @JavascriptInterface
+        public void update(String title, boolean playing) {
+            MediaService.touch(MainActivity.this, title, playing);
+        }
+
+        @JavascriptInterface
+        public String version() {
+            return myVersion();
+        }
+    }
+
+    @Override
+    protected void onDestroy() {
+        MediaService.listener = null;
+        try {
+            stopService(new Intent(this, MediaService.class));
+        } catch (Exception ignored) {
+        }
+        super.onDestroy();
+    }
+
+    void captureTitle(WebView view) {
+        view.evaluateJavascript("(document.getElementById('title')||{}).textContent||''", value -> {
+            try {
+                Object o = new JSONTokener(value).nextValue();
+                if (o instanceof String) {
+                    String t = ((String) o).trim();
+                    if (!t.isEmpty() && !t.equals("—")) {
+                        sp.edit().putString("last_title", t).apply();
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+        });
+    }
+
     void openMenu() {
         new AlertDialog.Builder(this)
-                .setItems(new String[]{"刷新页面", "检查更新", "重新登录"}, (d, which) -> {
+                .setItems(new String[]{"语音测试", "刷新页面", "检查更新", "重新登录", "退出 APP"}, (d, which) -> {
                     if (which == 0) {
-                        webView.reload();
+                        openVoiceTest();
                     } else if (which == 1) {
+                        webView.reload();
+                    } else if (which == 2) {
                         checkUpdate(true);
-                    } else {
+                    } else if (which == 3) {
                         confirmLogout();
+                    } else {
+                        finishAndRemoveTask();
                     }
                 })
                 .show();
+    }
+
+    void openVoiceTest() {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, 7);
+            return;
+        }
+        loadVoicePage();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == 7) {
+            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                loadVoicePage();
+            } else {
+                Toast.makeText(this, "没有麦克风权限，手机语音测试不可用", Toast.LENGTH_LONG).show();
+            }
+        }
+    }
+
+    void loadVoicePage() {
+        String b = publicBase;
+        if (b == null || !b.startsWith("https://")) b = normalize(defBase);
+        if (b == null || !b.startsWith("https://")) {
+            Toast.makeText(this, "没有 HTTPS 地址，手机麦克风不可用", Toast.LENGTH_LONG).show();
+            b = base;
+        }
+        webView.loadUrl(b + "voice");
     }
 
     void confirmLogout() {

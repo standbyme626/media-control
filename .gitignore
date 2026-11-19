@@ -1,6 +1,8 @@
 __pycache__/
 *.pyc
+.pytest_cache/
 .env
+*.env.local
 *.local
 *.token
 *.log
@@ -11,5 +13,6 @@ config.properties
 *.apk
 *.idsig
 *.jks
+*.bak-*
 android/build/
 mc-latest.json

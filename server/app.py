@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Fixed-action media control page for the Windows bridge.
+"""media-web：手机端控制 Windows 受控浏览器播放 B 站音乐的 Web 服务。
 
-Security model:
-- Only GET / , GET /api/status, GET /api/health, POST /api/pause, POST /api/play.
-- No user-controlled path, file name, command or action string reaches a shell.
-- SSH command is a fixed argv list; the bridge path is one of two constants.
-- HTTP Basic auth (over the TLS reverse proxy) + per-process CSRF header.
-- Per-IP rate limit; no CORS; no directory/file serving.
+架构：
+  手机浏览器 / Android 壳  --HTTP(S)-->  media-web(:8097)  --常驻 SSH 隧道-->  Windows bridge(:8765)  --CDP-->  Edge
+
+安全模型：
+- 只暴露固定端点白名单，任何用户输入都不会进 shell（argv 直传 + shlex 远程引用）。
+- 鉴权：HTTP Basic（公网走 TLS 反代）+ H5 一次性 token + 飞书 OAuth 三条路，统一签发 HMAC Cookie。
+- 鉴权在读取请求体之前完成；同 IP 登录失败 5 次锁 15 分钟；分 IP 令牌桶限流。
+- 写操作要求 X-CSRF-Token（进程级随机值，随页面下发）；CSP nonce、no CORS、不做静态目录服务。
+- 未配置 MEDIA_WEB_PASSWORD 时整体拒服务（fail closed）。
 """
 from __future__ import annotations
 
@@ -15,6 +18,7 @@ import hashlib
 import hmac
 import json
 import os
+import shlex
 import pathlib
 import re
 import secrets
@@ -28,10 +32,12 @@ from collections import defaultdict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
-HOST = "0.0.0.0"
-PORT = 8097
+HOST = os.environ.get("MEDIA_WEB_HOST", "0.0.0.0")
+PORT = int(os.environ.get("MEDIA_WEB_PORT", "8097"))
 USER = os.environ.get("MEDIA_WEB_USER", "media")
-PASSWORD = os.environ.get("MEDIA_WEB_PASSWORD", "wasd1234")
+PASSWORD = os.environ.get("MEDIA_WEB_PASSWORD", "")
+AUTH_CONFIGURED = bool(PASSWORD)          # 未设置密码时 fail closed
+TRUST_PROXY_HEADERS = os.environ.get("MEDIA_TRUST_PROXY", "1") == "1"
 def _load_csrf() -> str:
     path = pathlib.Path(os.environ.get("MEDIA_WEB_CSRF_FILE", "/etc/media-web-csrf.token"))
     try:
@@ -61,14 +67,18 @@ COOKIE_TTL = 7 * 24 * 3600
 PUBLIC_URL = (os.environ.get("MEDIA_PUBLIC_URL", "").rstrip("/") + "/") if os.environ.get("MEDIA_PUBLIC_URL") else ""
 FEISHU_APP_ID = os.environ.get("FEISHU_APP_ID", "")
 FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
-FEISHU_REDIRECT_URI = os.environ.get(
-    "FEISHU_REDIRECT_URI", "https://media.010626.xyz/feishu/callback"
-)
+FEISHU_REDIRECT_URI = os.environ.get("FEISHU_REDIRECT_URI", "")
 FEISHU_OPENID_FILE = os.environ.get("FEISHU_OPENID_FILE", "/etc/media-web-feishu-openid")
+# 预置白名单（逗号分隔）；为空时退化为「首次登录即绑定」并把 open_id 打日志
+FEISHU_OPENIDS = {x.strip() for x in os.environ.get("MEDIA_FEISHU_OPENIDS", "").split(",") if x.strip()}
 FEISHU_AUTH_URL = "https://open.feishu.cn/open-apis/authen/v1/index"
 FEISHU_TOKEN_URL = "https://open.feishu.cn/open-apis/authen/v1/access_token"
 FEISHU_APP_TOKEN_URL = "https://open.feishu.cn/open-apis/auth/v3/app_access_token/internal"
 _APP_TOKEN = {"token": "", "exp": 0.0}
+
+# 温湿度卡片是可选的旁路模块，默认关闭；配置 MEDIA_CLIMATE_HOST 才启用
+CLIMATE_HOST = os.environ.get("MEDIA_CLIMATE_HOST", "")
+CLIMATE_CMD = os.environ.get("MEDIA_CLIMATE_CMD", "iot-latest")
 _CLIMATE = {"ts": 0.0, "data": None}
 _CLIMATE_LOCK = threading.Lock()
 _TABS = {"ts": 0.0, "data": None}
@@ -78,8 +88,12 @@ _VIDEOS_LOCK = threading.Lock()
 
 WIN_HOST = os.environ.get("MEDIA_WIN_HOST", "")
 WIN_MAC = os.environ.get("MEDIA_WIN_MAC", "")
-SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "winpc"]
-BRIDGE = "http://127.0.0.1:8765/"
+SSH_TARGET = os.environ.get("MEDIA_SSH_TARGET", "winpc")
+SSH_PORT = int(os.environ.get("MEDIA_SSH_PORT", "22"))
+SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", SSH_TARGET]
+BRIDGE = os.environ.get("MEDIA_BRIDGE_URL", "http://127.0.0.1:8765/")
+SSH_FALLBACK = os.environ.get("MEDIA_BRIDGE_SSH", "1") == "1"
+H5_TOKEN_FILE = os.environ.get("MEDIA_H5_TOKEN_FILE", "/etc/media-web-h5.token")
 ACTIONS = {"pause", "play", "next", "prev", "mute"}
 _SLEEP = {"timer": None, "due": 0.0, "gen": 0}
 _SLEEP_LOCK = threading.Lock()
@@ -87,6 +101,21 @@ _SLEEP_LOCK = threading.Lock()
 _RATE: dict[str, deque] = defaultdict(deque)
 _RATE_LOCK = threading.Lock()
 _ACTION_LOCK = threading.Lock()
+VERSION = "3.5.0"
+START_TS = time.time()
+STATUS_TTL = float(os.environ.get("MEDIA_STATUS_TTL", "0.8"))
+_STATUS = {"ts": 0.0, "data": None}     # /api/status 短 TTL 缓存
+_STATUS_LOCK = threading.Lock()
+_PC = {"ts": 0.0, "online": None}       # 电脑在线探测缓存
+_PC_LOCK = threading.Lock()
+
+# 登录失败锁定：同一 IP 10 分钟内失败 5 次，锁 15 分钟
+FAIL_MAX = int(os.environ.get("MEDIA_FAIL_MAX", "5"))
+FAIL_WINDOW = float(os.environ.get("MEDIA_FAIL_WINDOW", "600"))
+LOCK_SECONDS = float(os.environ.get("MEDIA_LOCK_SECONDS", "900"))
+_FAILS: dict[str, deque] = defaultdict(deque)
+_LOCKS: dict[str, float] = {}
+_FAIL_LOCK = threading.Lock()
 
 
 def _allow(ip: str, limit: int = 60, window: float = 60.0) -> bool:
@@ -101,7 +130,74 @@ def _allow(ip: str, limit: int = 60, window: float = 60.0) -> bool:
         return True
 
 
+def _login_locked(ip: str) -> float:
+    """返回剩余锁定秒数，0 表示未锁定。"""
+    now = time.monotonic()
+    with _FAIL_LOCK:
+        until = _LOCKS.get(ip, 0.0)
+        if until <= now:
+            _LOCKS.pop(ip, None)
+            return 0.0
+        return until - now
+
+
+def _login_failed(ip: str) -> int:
+    """记一次失败；达到阈值就锁定并返回剩余秒数（0 表示还没锁）。"""
+    now = time.monotonic()
+    with _FAIL_LOCK:
+        q = _FAILS[ip]
+        while q and now - q[0] > FAIL_WINDOW:
+            q.popleft()
+        q.append(now)
+        if len(q) >= FAIL_MAX:
+            _LOCKS[ip] = now + LOCK_SECONDS
+            _FAILS[ip].clear()
+            print("[auth] lockout ip=%s for %ds" % (ip, int(LOCK_SECONDS)), flush=True)
+            return LOCK_SECONDS
+        return 0.0
+
+
+def _login_ok(ip: str) -> None:
+    with _FAIL_LOCK:
+        _FAILS.pop(ip, None)
+        _LOCKS.pop(ip, None)
+
+
+def _status_invalidate() -> None:
+    """任何写操作之后丢掉快照，避免前端 0.8s 内看到旧状态。"""
+    with _STATUS_LOCK:
+        _STATUS["ts"] = 0.0
+        _STATUS["data"] = None
+
+
+def _deny_ip(ip: str) -> str:
+    """去掉端口、压缩过长的 IPv6，作为限流桶 key。"""
+    ip = (ip or "").strip()
+    if ip.count(":") == 1 and "." in ip:      # 1.2.3.4:5678
+        ip = ip.rsplit(":", 1)[0]
+    return ip[:64] or "unknown"
+
+
 _DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _ssh_curl(path: str, body: bytes | None = None, ctype: str = "", timeout: int = 8) -> dict:
+    """隧道没起来时的兜底：让 Windows 自己去 curl 本机桥。
+
+    argv 直传、URL 只做远程 shell 引用（shlex.quote），不拼字符串。
+    """
+    cmd = SSH + ["curl", "-s", "--max-time", str(timeout)]
+    if body is not None:
+        cmd += ["-X", "POST", "-H", "Content-Type: " + shlex.quote(ctype), "--data-binary", "@-"]
+    cmd.append(shlex.quote(BRIDGE + path))
+    r = subprocess.run(cmd, input=body, capture_output=True, timeout=timeout + 10)
+    if r.returncode != 0:
+        raise RuntimeError("bridge unreachable")
+    out = r.stdout.decode("utf-8", "replace") if isinstance(r.stdout, bytes) else r.stdout
+    data = json.loads(out)
+    if not isinstance(data, dict):
+        raise RuntimeError("bad bridge response")
+    return data
 
 
 def _bridge(path: str) -> dict:
@@ -115,16 +211,10 @@ def _bridge(path: str) -> dict:
         if not isinstance(data, dict):
             raise RuntimeError("bad bridge response")
         return data
-    except Exception:
-        pass
-    cmd = SSH + ["curl", "-s", "--max-time", "8", '"' + BRIDGE + path + '"']
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-    if r.returncode != 0:
-        raise RuntimeError("bridge unreachable")
-    data = json.loads(r.stdout)
-    if not isinstance(data, dict):
-        raise RuntimeError("bad bridge response")
-    return data
+    except Exception as exc:
+        if not SSH_FALLBACK:
+            raise RuntimeError("bridge unreachable: %s" % exc)
+    return _ssh_curl(path)
 
 
 def _bridge_post(path: str, body: bytes, ctype: str) -> dict:
@@ -137,56 +227,55 @@ def _bridge_post(path: str, body: bytes, ctype: str) -> dict:
         if not isinstance(data, dict):
             raise RuntimeError("bad bridge response")
         return data
-    except Exception:
-        pass
-    cmd = SSH + ["curl", "-s", "--max-time", "30", "-X", "POST",
-                 "-H", "Content-Type: " + ctype, "--data-binary", "@-",
-                 '"' + BRIDGE + path + '"']
-    r = subprocess.run(cmd, input=body, capture_output=True, timeout=45)
-    if r.returncode != 0:
-        raise RuntimeError("bridge unreachable")
-    data = json.loads(r.stdout.decode("utf-8"))
-    if not isinstance(data, dict):
-        raise RuntimeError("bad bridge response")
-    return data
+    except Exception as exc:
+        if not SSH_FALLBACK:
+            raise RuntimeError("bridge unreachable: %s" % exc)
+    return _ssh_curl(path, body=body, ctype=ctype, timeout=30)
 
 
-def _status() -> dict:
+def _status_error(reason: str, error: str, pc_online) -> dict:
+    """失败也要带 reason，前端才能给出不同文案和不同按钮。"""
+    return {"ok": False, "reason": reason, "error": error, "pc_online": pc_online,
+            "sleep_due": _sleep_due(), "updated": int(time.time())}
+
+
+def _status_uncached() -> dict:
     online = _pc_online()
     if online is False:
-        return {"ok": False, "error": "电脑离线", "pc_online": False,
-                "sleep_due": _sleep_due()}
+        return _status_error("offline", "电脑离线", False)
     try:
         cdp = _bridge("cdp/status")
-        if cdp.get("ok"):
-            return {
-                "ok": True,
-                "title": TITLE_SUFFIX_RE.sub("", cdp.get("title") or "").strip(),
-                "app": "Microsoft Edge（受控）",
-                "status": "paused" if cdp.get("paused") else "playing",
-                "volume": cdp.get("volume"),
-                "muted": cdp.get("muted"),
-                "url": cdp.get("url") or "",
-                "pos": cdp.get("t"),
-                "dur": cdp.get("dur"),
-                "backend": "cdp",
-                "vvol": cdp.get("vvol"),
-                "rate": cdp.get("rate"),
-                "dm": cdp.get("dm"),
-                "eq": cdp.get("eq"),
-                "queue": cdp.get("queue"),
-                "pc_online": online,
-                "sleep_due": _sleep_due(),
-                "updated": int(time.time()),
-            }
-    except Exception:
-        pass
+    except Exception as exc:
+        return _status_error("bridge_down", "媒体桥不可达：%s" % exc, online)
+    if cdp.get("ok"):
+        return {
+            "ok": True,
+            "title": TITLE_SUFFIX_RE.sub("", cdp.get("title") or "").strip(),
+            "app": "Microsoft Edge（受控）",
+            "status": "paused" if cdp.get("paused") else "playing",
+            "volume": cdp.get("volume"),
+            "muted": cdp.get("muted"),
+            "url": cdp.get("url") or "",
+            "pos": cdp.get("t"),
+            "dur": cdp.get("dur"),
+            "backend": "cdp",
+            "vvol": cdp.get("vvol"),
+            "rate": cdp.get("rate"),
+            "dm": cdp.get("dm"),
+            "eq": cdp.get("eq"),
+            "queue": cdp.get("queue"),
+            "pc_online": online,
+            "sleep_due": _sleep_due(),
+            "updated": int(time.time()),
+        }
+    # CDP 通了但没有可播放目标，退到系统媒体会话（SMTC）
     try:
         data = _bridge("list")
     except Exception:
-        return {"ok": False, "error": "媒体桥不可达", "pc_online": online,
-                "sleep_due": _sleep_due()}
+        return _status_error("no_player", cdp.get("error") or "没有受控播放页", online)
     chosen = data.get("chosen") or {}
+    if not chosen:
+        return _status_error("no_player", "没有受控播放页", online)
     return {
         "ok": True,
         "title": chosen.get("title") or "",
@@ -201,18 +290,42 @@ def _status() -> dict:
     }
 
 
+def _status() -> dict:
+    """多端同时轮询时共享同一份快照，默认 TTL 0.8s。"""
+    now = time.time()
+    with _STATUS_LOCK:
+        cached = _STATUS["data"]
+        if cached and now - _STATUS["ts"] < STATUS_TTL:
+            return cached
+    data = _status_uncached()
+    with _STATUS_LOCK:
+        _STATUS["ts"] = time.time()
+        _STATUS["data"] = data
+    return data
+
+
 def _set_volume(level: int) -> dict:
     return _bridge("volume?level=%d" % level)
 
 
-def _pc_online(timeout: float = 1.2):
+def _pc_online(timeout: float = 1.2, ttl: float = 10.0):
+    """SSH 端口探测，带 10s 缓存（否则 5s 轮询会一直开新连接）。"""
     if not WIN_HOST:
         return None
+    now = time.monotonic()
+    with _PC_LOCK:
+        val = _PC["online"]
+        if val is not None and now - _PC["ts"] < ttl:
+            return val
     try:
-        with socket.create_connection((WIN_HOST, 22), timeout=timeout):
-            return True
+        with socket.create_connection((WIN_HOST, SSH_PORT), timeout=timeout):
+            val = True
     except OSError:
-        return False
+        val = False
+    with _PC_LOCK:
+        _PC["ts"] = now
+        _PC["online"] = val
+    return val
 
 
 def _wake() -> dict:
@@ -310,19 +423,28 @@ def _set_sleep(minutes: int) -> dict:
 
 
 def _climate() -> dict:
+    """可选的旁路模块：从另一台内网主机读温湿度快照。未配置 MEDIA_CLIMATE_HOST 时直接返回 disabled。"""
+    if not CLIMATE_HOST:
+        return {"ok": False, "disabled": True, "error": "climate module disabled"}
     now = time.time()
     with _CLIMATE_LOCK:
         cached = _CLIMATE["data"]
         if cached and now - _CLIMATE["ts"] < 5:
             return cached
-    r = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
-         "aliyun47", "/usr/local/bin/iot-latest"],
-        capture_output=True, text=True, timeout=15,
-    )
-    if r.returncode != 0:
-        raise RuntimeError("climate unreachable")
-    raw = json.loads(r.stdout)
+    try:
+        r = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", CLIMATE_HOST, CLIMATE_CMD],
+            capture_output=True, text=True, timeout=15,
+        )
+        if r.returncode != 0:
+            raise RuntimeError("climate unreachable")
+        raw = json.loads(r.stdout)
+    except Exception as exc:
+        with _CLIMATE_LOCK:
+            cached = _CLIMATE["data"]
+        if cached:                      # 失败回落上次快照，前端只标 stale
+            return dict(cached, stale=True, error=str(exc))
+        raise
     latest = raw.get("latest") or {}
     devices = raw.get("devices") or []
     ts = int(latest.get("ts") or 0)
@@ -493,14 +615,24 @@ def _check_state(value: str) -> bool:
 
 
 def _allowed_openid(open_id: str) -> bool:
+    """优先用 MEDIA_FEISHU_OPENIDS 预置白名单；没配时才退化成首次登录绑定。"""
+    if not open_id:
+        return False
+    if FEISHU_OPENIDS:
+        return any(hmac.compare_digest(x, open_id) for x in FEISHU_OPENIDS)
     p = pathlib.Path(FEISHU_OPENID_FILE)
     try:
         lines = [x.strip() for x in p.read_text(encoding="utf-8").splitlines() if x.strip()]
     except FileNotFoundError:
         lines = []
     if not lines:
-        p.write_text(open_id + "\n", encoding="utf-8")
-        p.chmod(0o600)
+        print("[feishu-oauth] binding first open_id=%r" % open_id, flush=True)
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(open_id + "\n", encoding="utf-8")
+            p.chmod(0o600)
+        except Exception as exc:
+            print("[feishu-oauth] cannot persist open_id: %r" % exc, flush=True)
         return True
     return any(hmac.compare_digest(x, open_id) for x in lines)
 
@@ -747,14 +879,18 @@ function showMute(m){
   if(m === null || m === undefined) return;
   $('mute').textContent = m ? '🔇 取消静音' : '🔊 静音';
 }
+let posBase = null, posAt = 0, playing = false;
 function renderProgress(pos, dur){
   const el = $('seek');
   seekDur = Number(dur) || 0;
   if(!seekDur || pos === null || pos === undefined){
     el.disabled = true;
+    posBase = null;
     $('posTxt').textContent = '--:-- / --:--';
     return;
   }
+  posBase = Number(pos) || 0;
+  posAt = performance.now();
   el.max = Math.max(1, Math.round(seekDur));
   if(!seekDragging){
     el.value = Math.min(seekDur, Math.max(0, Math.round(pos)));
@@ -762,6 +898,15 @@ function renderProgress(pos, dur){
   }
   el.disabled = busy;
 }
+// 两次采样之间本地外推，进度条不再每 5 秒跳一格
+function tickProgress(){
+  if(posBase === null || !seekDur || seekDragging || busy || $('seek').disabled) return;
+  if(!playing) return;
+  const pos = Math.min(seekDur, posBase + (performance.now() - posAt) / 1000);
+  $('seek').value = Math.round(pos);
+  $('posTxt').textContent = fmtSec(pos) + ' / ' + fmtSec(seekDur);
+}
+setInterval(tickProgress, 1000);
 function setOffline(pcOff){
   $('badge').textContent = pcOff ? '电脑离线' : '离线';
   $('badge').className = 'badge bad';
@@ -772,11 +917,16 @@ function setOffline(pcOff){
 }
 function render(d){
   if(!d.ok){
+    playing = false;
+    const reason = d.reason || '';
     setOffline(d.pc_online === false);
     $('title').textContent = d.error || '桥不可达';
-    $('app').textContent = d.pc_online === false ? '点上方按钮尝试唤醒'
+    $('app').textContent = reason === 'offline' ? '点上方按钮尝试唤醒'
+      : reason === 'bridge_down' ? '检查 Windows 上的媒体桥是否在跑'
+      : reason === 'no_player' ? '在电脑上打开一个 B 站视频页'
       : (d.pc_online === true ? '电脑在线，等待媒体桥启动' : '');
     sleepDue = d.sleep_due || 0;
+    syncMediaSession(null);
     return;
   }
   const st = d.status || 'unknown';
@@ -795,7 +945,13 @@ function render(d){
   if(d.rate) $('speed').value = String(d.rate);
   if(d.dm !== null && d.dm !== undefined) $('dmBtn').textContent = d.dm ? '弹幕开' : '弹幕关';
   if(d.eq !== null && d.eq !== undefined) $('eqBtn').textContent = d.eq ? '均衡开' : '均衡';
+  playing = st === 'playing';
+  // 交给 Android 壳：系统媒体会话 + 通知栏 + 锁屏
+  if(window.AndroidMedia && AndroidMedia.update){
+    try { AndroidMedia.update(d.title || '', playing); } catch(e){}
+  }
   renderProgress(d.pos, d.dur);
+  syncMediaSession({title: d.title, playing: playing, pos: d.pos, dur: d.dur});
   sleepDue = d.sleep_due || 0;
   const offline = d.pc_online === false;
   $('pause').disabled = busy || offline || st === 'paused';
@@ -806,8 +962,55 @@ function render(d){
   $('sleep').disabled = offline;
 }
 async function refresh(){
-  try { const r = await fetch('/api/status', {cache:'no-store'}); render(await r.json()); }
-  catch(e){ render({ok:false, error:'请求失败'}); }
+  try {
+    const r = await fetch('/api/status', {cache:'no-store'});
+    const d = await r.json();
+    failCount = 0;
+    render(d);
+    return d;
+  } catch(e){
+    failCount++;
+    render({ok:false, error:'请求失败'});
+    return null;
+  }
+}
+// 锁屏 / 通知栏（Android Chrome、PWA、以及支持的 WebView 宿主）
+function syncMediaSession(info){
+  if(!('mediaSession' in navigator)) return;
+  try{
+    if(info === null){ navigator.mediaSession.playbackState = 'none'; return; }
+    const art = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(
+      '<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512">' +
+      '<rect width="512" height="512" fill="#111922"/>' +
+      '<text x="256" y="330" font-size="240" text-anchor="middle" fill="#5b8def">♪</text></svg>');
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: info.title || '未知',
+      artist: 'B站音乐',
+      artwork: [{src: art, sizes: '512x512', type: 'image/svg+xml'}]
+    });
+    navigator.mediaSession.playbackState = info.playing ? 'playing' : 'paused';
+    if(info.dur > 0 && info.pos !== null && info.pos !== undefined){
+      navigator.mediaSession.setPositionState({
+        duration: info.dur, position: Math.min(info.dur, Math.max(0, info.pos)), playbackRate: 1
+      });
+    }
+  } catch(e){}
+}
+// Android 壳收到锁屏/耳机按键后回调这里
+window.mcMediaAction = function(a){ if(!busy) act(a); };
+if('mediaSession' in navigator && navigator.mediaSession.setActionHandler){
+  const MS_ACTIONS = {play:'play', pause:'pause', nexttrack:'next', previoustrack:'prev'};
+  for(const a in MS_ACTIONS){
+    try { navigator.mediaSession.setActionHandler(a, () => act(MS_ACTIONS[a])); } catch(e){}
+  }
+  try {
+    navigator.mediaSession.setActionHandler('seekto', (e) => {
+      if(e && e.seekTime !== null && e.seekTime !== undefined && !busy && seekDur){
+        $('seek').value = Math.round(Math.min(seekDur, e.seekTime));
+        sendSeek();
+      }
+    });
+  } catch(e){}
 }
 async function post(url, body){
   const r = await fetch(url, {
@@ -820,7 +1023,13 @@ async function post(url, body){
     setTimeout(() => location.reload(), 600);
     return null;
   }
-  return r.json();
+  if(r.status === 401){ msg('登录失效，请重新打开页面'); return null; }
+  if(r.status === 429){
+    const wait = r.headers.get('Retry-After');
+    msg(wait ? ('太频繁或登录被锁，约 ' + wait + ' 秒后再试') : '操作太频繁，稍后重试');
+    return null;
+  }
+  try { return await r.json(); } catch(e){ msg('响应异常'); return null; }
 }
 async function act(a){
   if(busy) return;
@@ -1176,7 +1385,6 @@ setInterval(() => {
 }, 30000);
 document.addEventListener('visibilitychange', () => {
   if(document.hidden) return;
-  if(!busy) refresh();
   if(lastRefresh && Date.now() - lastRefresh >= AUTO_MS) manualRefresh();
 });
 async function sendSeek(){
@@ -1255,8 +1463,28 @@ $('mute').onclick = () => act('mute');
 $('play').onclick = () => act('play');
 $('pause').onclick = () => act('pause');
 $('refresh').onclick = refresh;
-refresh();
-setInterval(() => { if(!busy && !document.hidden) refresh(); }, 5000);
+// 轮询改为自适应：播放中 5s、暂停 15s、失败指数退避、页面隐藏完全停
+let refreshTimer = 0, failCount = 0;
+function refreshDelay(){
+  if(failCount > 0) return Math.min(30000, 4000 * Math.pow(2, failCount));
+  return playing ? 5000 : 15000;
+}
+function scheduleRefresh(ms){
+  clearTimeout(refreshTimer);
+  if(document.hidden) return;
+  refreshTimer = setTimeout(tick, Math.max(500, ms | 0));
+}
+async function tick(){
+  if(document.hidden) return;
+  if(busy){ scheduleRefresh(1500); return; }
+  await refresh();
+  scheduleRefresh(refreshDelay());
+}
+document.addEventListener('visibilitychange', () => {
+  if(document.hidden){ clearTimeout(refreshTimer); return; }
+  tick();
+});
+tick();
 </script>
 </body>
 </html>"""
@@ -1473,6 +1701,7 @@ refresh();
 class Handler(BaseHTTPRequestHandler):
     server_version = "media-web"
     sys_version = ""
+    protocol_version = "HTTP/1.1"      # 复用连接，省掉每次请求的建连开销
 
     def _cookie_ok(self) -> bool:
         raw = self.headers.get("Cookie", "")
@@ -1498,6 +1727,8 @@ class Handler(BaseHTTPRequestHandler):
     def _auth(self) -> bool:
         if self._cookie_ok():
             return True
+        if not AUTH_CONFIGURED:          # 没配密码就整体拒服务，不留后门
+            return False
         h = self.headers.get("Authorization", "")
         if not h.startswith("Basic "):
             return False
@@ -1509,7 +1740,13 @@ class Handler(BaseHTTPRequestHandler):
         return hmac.compare_digest(user, USER) and hmac.compare_digest(pw, PASSWORD)
 
     def _ip(self) -> str:
-        return self.client_address[0]
+        """反代（cloudflared / nginx）后 client_address 恒为 127.0.0.1，此时信任 CF-Connecting-IP。"""
+        ip = self.client_address[0]
+        if TRUST_PROXY_HEADERS and ip in ("127.0.0.1", "::1"):
+            cf = (self.headers.get("CF-Connecting-IP") or "").strip()
+            if cf and re.fullmatch(r"[0-9A-Fa-f:.]{3,45}", cf):
+                return _deny_ip(cf)
+        return _deny_ip(ip)
 
     def _send(self, code: int, body: bytes, ctype: str, extra: dict | None = None, nonce: str = "") -> None:
         self.send_response(code)
@@ -1526,6 +1763,8 @@ class Handler(BaseHTTPRequestHandler):
             "img-src 'self' data: https://*.hdslb.com https://*.bilibili.com; base-uri 'none'; form-action 'none'; "
             "frame-ancestors 'none'",
         )
+        if self.headers.get("X-Forwarded-Proto", "").lower() == "https":
+            self.send_header("Strict-Transport-Security", "max-age=15552000")
         if extra:
             for k, v in extra.items():
                 self.send_header(k, v)
@@ -1541,12 +1780,26 @@ class Handler(BaseHTTPRequestHandler):
                    {"WWW-Authenticate": 'Basic realm="media", charset="UTF-8"'})
 
     def _guard(self) -> bool:
-        if not _allow(self._ip()):
+        ip = self._ip()
+        wait = _login_locked(ip)
+        if wait > 0:
+            self._send(429, b"too many failed logins", "text/plain; charset=utf-8",
+                       {"Retry-After": str(int(wait))})
+            return False
+        if not _allow(ip):
             self._json({"ok": False, "error": "too many requests"}, 429)
             return False
         if not self._auth():
+            # 只有「带了凭据但不对」才计入爆破计数；浏览器首次 401 挑战不算
+            if self.headers.get("Authorization"):
+                locked = _login_failed(ip)
+                if locked:
+                    self._send(429, b"too many failed logins", "text/plain; charset=utf-8",
+                               {"Retry-After": str(int(locked))})
+                    return False
             self._deny()
             return False
+        _login_ok(ip)
         return True
 
     def do_GET(self) -> None:
@@ -1641,7 +1894,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, html.encode("utf-8"), "text/html; charset=utf-8", nonce=nonce)
             return
         if path == "/api/health":
-            self._json({"ok": True})
+            self._json({"ok": True, "version": VERSION,
+                        "uptime_s": int(time.time() - START_TS),
+                        "auth": AUTH_CONFIGURED, "h5": bool(H5_TOKEN)})
             return
         if path == "/voice":
             nonce = secrets.token_urlsafe(16)
@@ -1655,7 +1910,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": False, "error": str(exc)}, 502)
             return
         if path == "/api/pc":
-            self._json({"ok": True, "online": _pc_online(), "wol": bool(WIN_MAC)})
+            # 唤醒后前端每 2s 探一次，这里不能用 10s 缓存
+            self._json({"ok": True, "online": _pc_online(ttl=2.0), "wol": bool(WIN_MAC)})
             return
         if path == "/api/climate":
             try:
@@ -1759,13 +2015,16 @@ class Handler(BaseHTTPRequestHandler):
         if length > max_len:
             self._json({"ok": False, "error": "body too large"}, 413)
             return
-        raw_bytes = self.rfile.read(length) if length else b""
-        raw = raw_bytes.decode("utf-8", "replace")
+        # 先鉴权 / CSRF，再读请求体：未认证请求没法让服务端白读 3 MB
         if not self._guard():
+            self.close_connection = True
             return
         if not hmac.compare_digest(self.headers.get("X-CSRF-Token", ""), CSRF):
             self._json({"ok": False, "error": "bad csrf token"}, 403)
+            self.close_connection = True
             return
+        raw_bytes = self.rfile.read(length) if length else b""
+        raw = raw_bytes.decode("utf-8", "replace")
         if not _allow(self._ip(), limit=60):
             self._json({"ok": False, "error": "too many actions"}, 429)
             return
@@ -1823,6 +2082,7 @@ class Handler(BaseHTTPRequestHandler):
         if not _ACTION_LOCK.acquire(blocking=False):
             self._json({"ok": False, "error": "busy"}, 409)
             return
+        _status_invalidate()
         try:
             if action == "open":
                 data = _open_bv(bv)

@@ -2,15 +2,18 @@ import asyncio
 import collections
 import ctypes
 import json
+import os
 import re
 import threading
 import time
 import traceback
 import urllib.request
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlsplit
 
-LOG = r"C:\Users\kkk\dodaios-bridge.log"
+# 本机路径都可以用环境变量覆盖，默认落在当前用户目录下
+HOME = os.environ.get("MEDIA_HOME") or os.path.expanduser("~")
+LOG = os.environ.get("BRIDGE_LOG", os.path.join(HOME, "dodaios-bridge.log"))
 
 
 def log(msg):
@@ -58,10 +61,15 @@ def set_mute(toggle=True):
         return {"ok": False, "error": str(exc)}
 
 
-CDP = "http://127.0.0.1:9222"
+CDP = os.environ.get("BRIDGE_CDP", "http://127.0.0.1:9222")
+PORT = int(os.environ.get("BRIDGE_PORT", "8765"))
 _LAST = {"id": ""}
 _PLAYER = {"id": ""}
 _LIST = {"id": ""}
+_SEARCH = {"id": ""}                     # 应用专用的搜索标签页，不劫持用户正在看的页面
+_STATUS_CACHE = {"ts": 0.0, "data": None}
+_STATUS_CACHE_LOCK = threading.Lock()
+STATUS_CACHE_TTL = float(os.environ.get("BRIDGE_STATUS_TTL", "0.8"))
 SEARCH_URL = "https://search.bilibili.com/all?keyword="
 
 VLOG = collections.deque(maxlen=40)
@@ -71,11 +79,13 @@ VST = {"on": True, "ready": False, "error": "", "device": None,
 _VOICE_REC = None
 _VLOCK = threading.Lock()
 _VEXEC = threading.Lock()
-_ACK_WAV = r"C:\Users\kkk\voice-ack-wozai.wav"
-_VOICE_DIR = r"C:\Users\kkk\models\sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09"
-_VAD_MODEL = r"C:\Users\kkk\models\silero_vad.onnx"
+_ACK_WAV = os.environ.get("BRIDGE_ACK_WAV", os.path.join(HOME, "voice-ack-wozai.wav"))
+_VOICE_DIR = os.environ.get(
+    "BRIDGE_VOICE_DIR",
+    os.path.join(HOME, "models", "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09"))
+_VAD_MODEL = os.environ.get("BRIDGE_VAD_MODEL", os.path.join(HOME, "models", "silero_vad.onnx"))
 
-_STATE_PATH = r"C:\Users\kkk\media-state.json"
+_STATE_PATH = os.environ.get("BRIDGE_STATE", os.path.join(HOME, "media-state.json"))
 _STATE = {"rate": 1.0, "vvol": 100, "progress": {}, "queue": [], "idx": -1, "auto": True}
 
 
@@ -90,13 +100,20 @@ def _load_state():
         pass
 
 
+_STATE_LOCK = threading.Lock()
+
+
 def _save_state():
+    """写临时文件再替换，避免断电/崩溃时把 state.json 写坏。"""
     try:
-        prog = _STATE.get("progress") or {}
-        if len(prog) > 300:
-            _STATE["progress"] = dict(sorted(prog.items(), key=lambda kv: kv[1])[-200:])
-        with open(_STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump(_STATE, f, ensure_ascii=False)
+        with _STATE_LOCK:
+            prog = _STATE.get("progress") or {}
+            if len(prog) > 300:
+                _STATE["progress"] = dict(sorted(prog.items(), key=lambda kv: kv[1])[-200:])
+            tmp = _STATE_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(_STATE, f, ensure_ascii=False)
+            os.replace(tmp, _STATE_PATH)
     except Exception:
         pass
 
@@ -309,8 +326,8 @@ def voice_loop_vad():
     global _VOICE_REC
     try:
         rec = sherpa_onnx.OfflineRecognizer.from_sense_voice(
-            model=_VOICE_DIR + r"\model.int8.onnx",
-            tokens=_VOICE_DIR + r"\tokens.txt",
+            model=os.path.join(_VOICE_DIR, "model.int8.onnx"),
+            tokens=os.path.join(_VOICE_DIR, "tokens.txt"),
             num_threads=2, use_itn=True, debug=False)
         _VOICE_REC = rec
     except Exception as exc:
@@ -357,7 +374,7 @@ def voice_loop_vad():
 
 
 
-_VOSK_DIR = r"C:\Users\kkk\models\vosk-model-small-cn-0.22"
+_VOSK_DIR = os.environ.get("BRIDGE_VOSK_DIR", os.path.join(HOME, "models", "vosk-model-small-cn-0.22"))
 
 
 def _duck(delta=-10):
@@ -377,8 +394,8 @@ def voice_loop_kws():
     import vosk
     try:
         rec = sherpa_onnx.OfflineRecognizer.from_sense_voice(
-            model=_VOICE_DIR + r"\model.int8.onnx",
-            tokens=_VOICE_DIR + r"\tokens.txt",
+            model=os.path.join(_VOICE_DIR, "model.int8.onnx"),
+            tokens=os.path.join(_VOICE_DIR, "tokens.txt"),
             num_threads=2, use_itn=True, debug=False)
         _VOICE_REC = rec
         vmodel = vosk.Model(_VOSK_DIR)
@@ -467,7 +484,6 @@ def voice_loop_kws():
 
 
 def voice_loop():
-    import os
     if os.path.isdir(_VOSK_DIR):
         try:
             voice_loop_kws()
@@ -595,17 +611,26 @@ def queue_set(videos, idx=0):
     return {"ok": True, "n": len(q), "idx": _STATE["idx"]}
 
 
+_QLOCK = threading.Lock()
+
+
 def queue_open(i):
-    q = _STATE.get("queue") or []
-    if not q:
-        return {"ok": False, "error": "empty queue"}
-    i = max(0, min(int(i), len(q) - 1))
-    _STATE["idx"] = i
-    _save_state()
-    v = q[i]
-    r = cdp_open_bv(v["bv"], v.get("p", 1))
-    return {"ok": bool(r.get("ok", True)), "idx": i, "n": len(q),
-            "bv": v["bv"], "p": v.get("p", 1), "title": v.get("title")}
+    """切到队列第 i 条。加锁避免「自动连播」和手机点「下一首」同时推进两条。"""
+    if not _QLOCK.acquire(timeout=8):
+        return {"ok": False, "error": "queue busy"}
+    try:
+        q = _STATE.get("queue") or []
+        if not q:
+            return {"ok": False, "error": "empty queue"}
+        i = max(0, min(int(i), len(q) - 1))
+        _STATE["idx"] = i
+        _save_state()
+        v = q[i]
+        r = cdp_open_bv(v["bv"], v.get("p", 1))
+        return {"ok": bool(r.get("ok", True)), "idx": i, "n": len(q),
+                "bv": v["bv"], "p": v.get("p", 1), "title": v.get("title")}
+    finally:
+        _QLOCK.release()
 
 
 def queue_next():
@@ -783,12 +808,15 @@ _AUTO = {"near_ts": 0.0, "cooldown": 0.0}
 
 
 def queue_monitor():
+    """每 2 秒看一次播放状态，负责进度落盘和「快到片尾自动下一首」。
+
+    直接调用内部函数，不再走 HTTP 自调用（那会占用唯一的处理线程）。
+    """
     last_save = 0
     while True:
         time.sleep(2)
         try:
-            with urllib.request.urlopen("http://127.0.0.1:8765/cdp/status", timeout=6) as r:
-                st = json.loads(r.read().decode("utf-8"))
+            st = cdp_status_cached()
             if not st.get("ok"):
                 continue
             url = st.get("url") or ""
@@ -817,12 +845,12 @@ def queue_monitor():
                         time.sleep(1)
                         _AUTO["cooldown"] = time.time() + 10
                         _AUTO["near_ts"] = 0.0
-                        urllib.request.urlopen("http://127.0.0.1:8765/queue/next", timeout=25).read()
+                        queue_next()
                 elif (not on_cur) and time.time() - _AUTO.get("near_ts", 0) < 30:
                     _AUTO["near_ts"] = 0.0
                     _AUTO["cooldown"] = time.time() + 10
                     time.sleep(1)
-                    urllib.request.urlopen("http://127.0.0.1:8765/queue/next", timeout=25).read()
+                    queue_next()
         except Exception:
             pass
 
@@ -1012,7 +1040,8 @@ def cdp_search(q, page=1, music=False, order=""):
         url += "&order=" + order
     if page > 1:
         url += "&page=%d" % page
-    tab = next((t for t in cdp_targets() if "search.bilibili.com" in (t.get("url") or "")), None)
+    # 只用应用自己的搜索标签页；用户自己开着的搜索页不动
+    tab = _find_tab(_SEARCH["id"])
     if tab is not None:
         try:
             cdp_call(tab, "Page.navigate", {"url": url})
@@ -1024,6 +1053,7 @@ def cdp_search(q, page=1, music=False, order=""):
             tab = cdp_new_tab(url)
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
+        _SEARCH["id"] = tab.get("id") or ""
     deadline = time.time() + 15
     while time.time() < deadline:
         try:
@@ -1038,7 +1068,14 @@ def cdp_search(q, page=1, music=False, order=""):
     return {"ok": False, "error": "search timeout"}
 
 
+def _find_tab(tid):
+    if not tid:
+        return None
+    return next((t for t in cdp_targets() if t.get("id") == tid), None)
+
+
 def cdp_open_bv(bv, p=1):
+    """在当前播放标签页里直接跳转，不再关旧开新（少一次标签页抖动 + 不污染浏览历史）。"""
     if not re.fullmatch(r"BV[0-9A-Za-z]+", bv or ""):
         return {"ok": False, "error": "bad bv"}
     try:
@@ -1046,22 +1083,32 @@ def cdp_open_bv(bv, p=1):
     except (TypeError, ValueError):
         p = 1
     url = "https://www.bilibili.com/video/%s/" % bv + ("?p=%d" % p if p > 1 else "")
-    victim = _PLAYER["id"]
-    if not victim:
+    tab = _find_tab(_PLAYER["id"])
+    if tab is not None:
         try:
-            st = cdp_status()
-            if st.get("ok") and "/video/" in (st.get("url") or ""):
-                victim = st.get("id")
+            cdp_call(tab, "Page.navigate", {"url": url})
         except Exception:
-            pass
-    cdp_close(victim)
-    try:
-        tab = cdp_new_tab(url)
-    except Exception as exc:
-        return {"ok": False, "error": str(exc)}
+            cdp_close(tab["id"])
+            tab = None
+    if tab is None:
+        try:
+            tab = cdp_new_tab(url)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
     _PLAYER["id"] = tab.get("id") or ""
     _LAST["id"] = _PLAYER["id"]
-    time.sleep(1.5)
+    _status_dirty()
+    # 等播放器就绪，而不是固定 sleep(1.5)
+    deadline = time.time() + 8
+    ready = False
+    while time.time() < deadline:
+        try:
+            ready = bool(cdp_eval(tab, "!!document.querySelector('video')"))
+        except Exception:
+            ready = False
+        if ready:
+            break
+        time.sleep(0.25)
     try:
         key = bv if p <= 1 else "%s#%d" % (bv, p)
         pos = (_STATE.get("progress") or {}).get(key) or 0
@@ -1111,6 +1158,26 @@ def cdp_status():
                       "next": ((_STATE.get("queue") or [])[int(_STATE.get("idx", -1)) + 1].get("title")
                                if 0 <= int(_STATE.get("idx", -1)) + 1 < len(_STATE.get("queue") or []) else ""),
                       "auto": bool(_STATE.get("auto"))}}
+
+
+def _status_dirty():
+    with _STATUS_CACHE_LOCK:
+        _STATUS_CACHE["ts"] = 0.0
+        _STATUS_CACHE["data"] = None
+
+
+def cdp_status_cached():
+    """多端轮询共享同一份快照：TTL 内只做一次 CDP 读取。"""
+    now = time.time()
+    with _STATUS_CACHE_LOCK:
+        cached = _STATUS_CACHE["data"]
+        if cached is not None and now - _STATUS_CACHE["ts"] < STATUS_CACHE_TTL:
+            return cached
+    data = cdp_status()
+    with _STATUS_CACHE_LOCK:
+        _STATUS_CACHE["ts"] = time.time()
+        _STATUS_CACHE["data"] = data
+    return data
 
 
 def cdp_activate(tid):
@@ -1371,7 +1438,7 @@ class Handler(BaseHTTPRequestHandler):
                 bv = (parse_qs(urlsplit(self.path).query).get("bv") or [""])[0]
                 body = cdp_open_bv(bv)
             elif path == "cdp/status":
-                body = cdp_status()
+                body = cdp_status_cached()
             elif path == "cdp/seek":
                 q = parse_qs(urlsplit(self.path).query)
                 try:
@@ -1563,7 +1630,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    log("bridge starting on 127.0.0.1:8765")
+    log("bridge starting on 127.0.0.1:%d" % PORT)
     try:
         threading.Thread(target=voice_loop, daemon=True).start()
     except Exception:
@@ -1572,4 +1639,6 @@ if __name__ == "__main__":
         threading.Thread(target=queue_monitor, daemon=True).start()
     except Exception:
         log("queue monitor error: " + traceback.format_exc())
-    HTTPServer(("127.0.0.1", 8765), Handler).serve_forever()
+    srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    srv.daemon_threads = True
+    srv.serve_forever()
