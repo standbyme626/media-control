@@ -504,6 +504,7 @@ public class MainActivity extends Activity {
     /** 系统媒体按键（锁屏/通知栏/耳机）-> 网页 */
     void onMediaAction(final String action) {
         final WebView w = webView;
+        android.util.Log.i("MediaControl", "forward to page: " + action);
         if (w == null) return;
         runOnUiThread(() -> {
             String js = "window.mcMediaAction&&window.mcMediaAction('" + action.replace("'", "") + "')";

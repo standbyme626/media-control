@@ -974,9 +974,11 @@ async function refresh(){
     return null;
   }
 }
-// 锁屏 / 通知栏（Android Chrome、PWA、以及支持的 WebView 宿主）
+// Android 壳里由原生 MediaSession 统一负责（避免两个会话同时抢媒体键）
+const HAS_NATIVE = !!(window.AndroidMedia && window.AndroidMedia.update);
+// 锁屏 / 通知栏（浏览器 / PWA 场景；壳内走原生）
 function syncMediaSession(info){
-  if(!('mediaSession' in navigator)) return;
+  if(HAS_NATIVE || !('mediaSession' in navigator)) return;
   try{
     if(info === null){ navigator.mediaSession.playbackState = 'none'; return; }
     const art = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(

@@ -106,6 +106,7 @@ public class MediaService extends Service {
 
     void fire(String action) {
         Listener l = listener;
+        android.util.Log.i("MediaControl", "media action: " + action + " listener=" + (l != null));
         if (l != null) l.onAction(action);
     }
 
