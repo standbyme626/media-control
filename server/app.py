@@ -2,8 +2,7 @@
 """Fixed-action media control page for the Windows bridge.
 
 Security model:
-- Fixed endpoints only: status, play/pause, next/prev, mute, seek, volume,
-  sleep timer, wake-on-LAN, tabs, Bilibili search/open.
+- Only GET / , GET /api/status, GET /api/health, POST /api/pause, POST /api/play.
 - No user-controlled path, file name, command or action string reaches a shell.
 - SSH command is a fixed argv list; the bridge path is one of two constants.
 - HTTP Basic auth (over the TLS reverse proxy) + per-process CSRF header.
@@ -29,10 +28,10 @@ from collections import defaultdict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
-HOST = os.environ.get("MEDIA_WEB_HOST", "127.0.0.1")
-PORT = int(os.environ.get("MEDIA_WEB_PORT", "8097"))
+HOST = "0.0.0.0"
+PORT = 8097
 USER = os.environ.get("MEDIA_WEB_USER", "media")
-PASSWORD = os.environ.get("MEDIA_WEB_PASSWORD", "")
+PASSWORD = os.environ.get("MEDIA_WEB_PASSWORD", "wasd1234")
 def _load_csrf() -> str:
     path = pathlib.Path(os.environ.get("MEDIA_WEB_CSRF_FILE", "/etc/media-web-csrf.token"))
     try:
@@ -59,27 +58,30 @@ except Exception:
 COOKIE_NAME = "media_h5"
 COOKIE_TTL = 7 * 24 * 3600
 
+PUBLIC_URL = (os.environ.get("MEDIA_PUBLIC_URL", "").rstrip("/") + "/") if os.environ.get("MEDIA_PUBLIC_URL") else ""
 FEISHU_APP_ID = os.environ.get("FEISHU_APP_ID", "")
 FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
 FEISHU_REDIRECT_URI = os.environ.get(
-    "FEISHU_REDIRECT_URI", "http://127.0.0.1:8097/feishu/callback"
+    "FEISHU_REDIRECT_URI", "https://media.010626.xyz/feishu/callback"
 )
 FEISHU_OPENID_FILE = os.environ.get("FEISHU_OPENID_FILE", "/etc/media-web-feishu-openid")
 FEISHU_AUTH_URL = "https://open.feishu.cn/open-apis/authen/v1/index"
 FEISHU_TOKEN_URL = "https://open.feishu.cn/open-apis/authen/v1/access_token"
 FEISHU_APP_TOKEN_URL = "https://open.feishu.cn/open-apis/auth/v3/app_access_token/internal"
 _APP_TOKEN = {"token": "", "exp": 0.0}
+_CLIMATE = {"ts": 0.0, "data": None}
+_CLIMATE_LOCK = threading.Lock()
 _TABS = {"ts": 0.0, "data": None}
 _TABS_LOCK = threading.Lock()
 _VIDEOS = {"ts": 0.0, "data": None}
 _VIDEOS_LOCK = threading.Lock()
 
-WIN_HOST = os.environ.get("MEDIA_WIN_HOST", "windows-host")
+WIN_HOST = os.environ.get("MEDIA_WIN_HOST", "")
 WIN_MAC = os.environ.get("MEDIA_WIN_MAC", "")
-SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", WIN_HOST]
-BRIDGE = os.environ.get("MEDIA_BRIDGE_URL", "http://127.0.0.1:8765/")
+SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "winpc"]
+BRIDGE = "http://127.0.0.1:8765/"
 ACTIONS = {"pause", "play", "next", "prev", "mute"}
-_SLEEP = {"timer": None, "due": 0.0}
+_SLEEP = {"timer": None, "due": 0.0, "gen": 0}
 _SLEEP_LOCK = threading.Lock()
 
 _RATE: dict[str, deque] = defaultdict(deque)
@@ -99,12 +101,51 @@ def _allow(ip: str, limit: int = 60, window: float = 60.0) -> bool:
         return True
 
 
+_DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 def _bridge(path: str) -> dict:
+    try:
+        try:
+            with _DIRECT.open(BRIDGE + path, timeout=12) as resp:
+                raw = resp.read()
+        except urllib.error.HTTPError as exc:
+            raw = exc.read()
+        data = json.loads(raw.decode("utf-8"))
+        if not isinstance(data, dict):
+            raise RuntimeError("bad bridge response")
+        return data
+    except Exception:
+        pass
     cmd = SSH + ["curl", "-s", "--max-time", "8", '"' + BRIDGE + path + '"']
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
     if r.returncode != 0:
         raise RuntimeError("bridge unreachable")
     data = json.loads(r.stdout)
+    if not isinstance(data, dict):
+        raise RuntimeError("bad bridge response")
+    return data
+
+
+def _bridge_post(path: str, body: bytes, ctype: str) -> dict:
+    try:
+        req = urllib.request.Request(BRIDGE + path, data=body, method="POST")
+        req.add_header("Content-Type", ctype)
+        with _DIRECT.open(req, timeout=40) as resp:
+            raw = resp.read()
+        data = json.loads(raw.decode("utf-8"))
+        if not isinstance(data, dict):
+            raise RuntimeError("bad bridge response")
+        return data
+    except Exception:
+        pass
+    cmd = SSH + ["curl", "-s", "--max-time", "30", "-X", "POST",
+                 "-H", "Content-Type: " + ctype, "--data-binary", "@-",
+                 '"' + BRIDGE + path + '"']
+    r = subprocess.run(cmd, input=body, capture_output=True, timeout=45)
+    if r.returncode != 0:
+        raise RuntimeError("bridge unreachable")
+    data = json.loads(r.stdout.decode("utf-8"))
     if not isinstance(data, dict):
         raise RuntimeError("bad bridge response")
     return data
@@ -129,6 +170,11 @@ def _status() -> dict:
                 "pos": cdp.get("t"),
                 "dur": cdp.get("dur"),
                 "backend": "cdp",
+                "vvol": cdp.get("vvol"),
+                "rate": cdp.get("rate"),
+                "dm": cdp.get("dm"),
+                "eq": cdp.get("eq"),
+                "queue": cdp.get("queue"),
                 "pc_online": online,
                 "sleep_due": _sleep_due(),
                 "updated": int(time.time()),
@@ -202,32 +248,100 @@ def _sleep_due() -> int:
         return int(_SLEEP["due"]) if _SLEEP["due"] > time.time() else 0
 
 
-def _sleep_fire() -> None:
+def _sleep_worker(gen: int) -> None:
     with _SLEEP_LOCK:
-        _SLEEP["timer"] = None
-        _SLEEP["due"] = 0.0
+        due = _SLEEP["due"]
+    time.sleep(max(0.0, due - time.time() - 20))
+    with _SLEEP_LOCK:
+        if gen != _SLEEP["gen"]:
+            return
+    vvol = None
+    try:
+        st = _bridge("cdp/status")
+        if st.get("ok") and st.get("vvol") is not None:
+            vvol = int(st.get("vvol"))
+    except Exception:
+        pass
+    for i in range(1, 21):
+        with _SLEEP_LOCK:
+            if gen != _SLEEP["gen"]:
+                if vvol is not None:
+                    try:
+                        _bridge("cdp/volume?level=%d" % vvol)
+                    except Exception:
+                        pass
+                return
+        if vvol is not None:
+            try:
+                _bridge("cdp/volume?level=%d" % int(vvol * (1 - i / 20.0)))
+            except Exception:
+                pass
+        time.sleep(1)
     try:
         _bridge("pause")
     except Exception:
         pass
+    if vvol is not None:
+        try:
+            _bridge("cdp/volume?level=%d" % vvol)
+        except Exception:
+            pass
+    with _SLEEP_LOCK:
+        if gen == _SLEEP["gen"]:
+            _SLEEP["timer"] = None
+            _SLEEP["due"] = 0.0
 
 
 def _set_sleep(minutes: int) -> dict:
     with _SLEEP_LOCK:
-        if _SLEEP["timer"] is not None:
-            _SLEEP["timer"].cancel()
+        _SLEEP["gen"] += 1
+        gen = _SLEEP["gen"]
         _SLEEP["timer"] = None
         _SLEEP["due"] = 0.0
         if minutes <= 0:
             return {"ok": True, "sleep": 0, "due": 0}
         due = time.time() + minutes * 60
-        timer = threading.Timer(minutes * 60, _sleep_fire)
-        timer.daemon = True
-        timer.start()
-        _SLEEP["timer"] = timer
         _SLEEP["due"] = due
-        return {"ok": True, "sleep": minutes, "due": int(due)}
+    t = threading.Thread(target=_sleep_worker, args=(gen,), daemon=True)
+    t.start()
+    with _SLEEP_LOCK:
+        _SLEEP["timer"] = t
+    return {"ok": True, "sleep": minutes, "due": int(due)}
 
+
+def _climate() -> dict:
+    now = time.time()
+    with _CLIMATE_LOCK:
+        cached = _CLIMATE["data"]
+        if cached and now - _CLIMATE["ts"] < 5:
+            return cached
+    r = subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+         "aliyun47", "/usr/local/bin/iot-latest"],
+        capture_output=True, text=True, timeout=15,
+    )
+    if r.returncode != 0:
+        raise RuntimeError("climate unreachable")
+    raw = json.loads(r.stdout)
+    latest = raw.get("latest") or {}
+    devices = raw.get("devices") or []
+    ts = int(latest.get("ts") or 0)
+    age = max(0, int(now - ts)) if ts else None
+    data = {
+        "ok": True,
+        "temp": latest.get("temp"),
+        "hum": latest.get("hum"),
+        "rssi": latest.get("rssi"),
+        "ts": ts,
+        "age_s": age,
+        "online": bool(age is not None and age < 180),
+        "dev": latest.get("dev") or (devices[0].get("dev") if devices else ""),
+        "iot_url": raw.get("iot_url") or "",
+    }
+    with _CLIMATE_LOCK:
+        _CLIMATE["ts"] = now
+        _CLIMATE["data"] = data
+    return data
 
 
 MUSIC_RE = re.compile(
@@ -313,8 +427,13 @@ def _videos(force: bool = False) -> dict:
     return data
 
 
-def _search(q: str, page: int = 1) -> dict:
-    return _bridge("cdp/search?q=" + quote(q) + "&page=%d" % page)
+def _search(q: str, page: int = 1, music: bool = False, order: str = "") -> dict:
+    path = "cdp/search?q=" + quote(q) + "&page=%d" % page
+    if music:
+        path += "&music=1"
+    if order in ("click", "pubdate", "dm", "stow"):
+        path += "&order=" + order
+    return _bridge(path)
 
 
 def _open_bv(bv: str) -> dict:
@@ -407,9 +526,27 @@ h1{font-size:17px;margin:0;font-weight:650;letter-spacing:.2px}
 .badge.bad{background:#3a1717;color:#f28b82}
 .track{background:#0d141c;border:1px solid #1d2a38;border-radius:14px;padding:16px;margin-bottom:12px}
 .title{font-size:16px;line-height:1.45;font-weight:600;word-break:break-word}
-.vol{display:flex;align-items:center;gap:12px;margin:0 2px 16px}
-.vol input[type=range]{flex:1;accent-color:#2563eb;height:4px;cursor:pointer}
-.vol #volVal{min-width:42px;text-align:right}
+.vols{display:flex;flex-direction:column;gap:8px;margin:0 2px 12px}
+.vrow{display:flex;align-items:center;gap:10px}
+.vrow .vlabel{width:34px;flex:none;font-size:12px;color:#8fa1b3}
+.vrow input[type=range]{flex:1;min-width:0;accent-color:#2563eb;height:4px;cursor:pointer}
+.vrow .vv{min-width:42px;text-align:right;font-size:12px;color:#8fa1b3;font-variant-numeric:tabular-nums}
+.tools{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 12px;font-size:12px;color:#8fa1b3}
+.tools select{background:#0d141c;border:1px solid #223042;color:#e8eef5;border-radius:8px;padding:6px 8px;font-size:12px}
+.tools button{border:1px solid #2a3a4d;background:#1a2634;color:#e8eef5;border-radius:8px;padding:7px 10px;font-size:12px;cursor:pointer}
+.tools label{display:flex;align-items:center;gap:4px}
+.tools #qinfo{margin-left:auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.queuebox{max-height:150px;overflow:auto;border:1px solid #1d2a38;border-radius:10px;background:#0d141c;margin:-4px 0 10px;padding:4px 10px}
+.qitem{display:flex;align-items:center;gap:8px;padding:6px 0;border-top:1px solid #17222e;font-size:12px;color:#c7d2de}
+.qitem:first-child{border-top:0}
+.qitem .qi{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.qitem .qx{border:0;background:none;color:#f28b82;font-size:14px;cursor:pointer;padding:0 2px}
+.qitem.cur .qi{color:#7fb0ff}
+.qactions{display:flex;gap:8px;padding:6px 0 2px;border-top:1px solid #17222e}
+.qactions button{border:1px solid #2a3a4d;background:#1a2634;color:#e8eef5;border-radius:8px;padding:5px 9px;font-size:12px;cursor:pointer}
+.volbtn{flex:none;width:38px;height:38px;padding:0;border:1px solid #2a3a4d;background:#1a2634;color:#e8eef5;border-radius:10px;font-size:19px;line-height:1;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;user-select:none;-webkit-user-select:none;touch-action:manipulation}
+.volbtn:hover{background:#22303f}
+.volbtn:active{background:#2563eb;border-color:#2563eb;color:#fff}
 .progress{display:flex;align-items:center;gap:10px;margin:0 2px 14px}
 .progress input[type=range]{flex:1;min-width:0;accent-color:#2563eb;height:4px;cursor:pointer}
 .progress input[type=range]:disabled{opacity:.35}
@@ -425,6 +562,7 @@ h1{font-size:17px;margin:0;font-weight:650;letter-spacing:.2px}
 .search input{flex:1;min-width:0;background:#0d141c;border:1px solid #223042;border-radius:10px;color:#e8eef5;padding:10px 12px;font-size:14px;outline:none}
 .search input:focus{border-color:#2563eb}
 .search button{border:1px solid #2563eb;background:#2563eb;color:#fff;border-radius:10px;padding:0 16px;font-size:14px;font-weight:600;cursor:pointer;white-space:nowrap}
+.search label{display:flex;align-items:center;gap:4px;font-size:12px;color:#8fa1b3;white-space:nowrap}
 .refreshbar{display:flex;align-items:center;gap:10px;margin:-4px 0 10px;font-size:11px;color:#8fa1b3}
 .refreshbar #pageBtn{margin-left:auto}
 .refreshbar .link{font-size:11px}
@@ -442,13 +580,13 @@ h1{font-size:17px;margin:0;font-weight:650;letter-spacing:.2px}
 .btn{flex:1;border:1px solid #2a3a4d;background:#1a2634;color:#e8eef5;border-radius:12px;padding:13px 10px;font-size:15px;font-weight:600;cursor:pointer}
 .btn.primary{background:#2563eb;border-color:#2563eb;color:#fff}
 .btn:disabled{opacity:.4;cursor:not-allowed}
-.foot{display:flex;align-items:center;gap:12px}
+.foot{display:flex;align-items:center;gap:10px;flex-wrap:wrap;row-gap:6px}
 .link{border:0;background:none;color:#7fb0ff;font-size:13px;cursor:pointer;padding:0}
 .note{margin-top:16px;padding-top:12px;border-top:1px solid #1d2a38;color:#64748b;font-size:11px;line-height:1.5}
 #msg{margin-left:auto}
 .body{display:flex;flex-direction:column}
 .controls,.browse{display:contents}
-.track{order:1}.progress{order:3}.search{order:4}.refreshbar{order:5}#results{order:6}.vol{order:7}.actions{order:8}.row2{order:9}.foot{order:10}
+.track{order:1}.progress{order:2}.search{order:3}.refreshbar{order:4}#results{order:5}.vols{order:6}.tools{order:7}.actions{order:8}.row2{order:9}.foot{order:10}
 @media (max-width:899px){
   html,body{height:100%}
   body{overflow:hidden;align-items:stretch;justify-content:flex-start;padding:8px}
@@ -458,14 +596,20 @@ h1{font-size:17px;margin:0;font-weight:650;letter-spacing:.2px}
   h1{font-size:16px}
   .head .muted{font-size:11px}
   .body{flex:1 1 auto;min-height:0}
-  .track,.climate,.progress,.search,.refreshbar,.vol,.actions,.row2,.foot{flex:none}
+  .track,.progress,.search,.refreshbar,.vols,.tools,.actions,.row2,.foot{flex:none}
   .track{padding:12px 14px;margin-bottom:8px}
-  .climate{padding:0 2px 8px;gap:12px;font-size:13px}
   .progress{margin:0 2px 8px}
   .search{margin-bottom:8px}
   .refreshbar{margin:0 0 8px}
   #results{flex:1 1 auto;min-height:120px;max-height:none;margin-bottom:8px}
-  .vol{margin:0 2px 8px}
+  .vols{gap:5px;margin:0 2px 8px}
+  .vrow{gap:6px}
+  .vrow .vlabel{width:30px;font-size:11px}
+  .vrow .vv{min-width:38px;font-size:11px}
+  .volbtn{width:34px;height:34px;font-size:17px;border-radius:9px}
+  .tools{gap:6px;margin-bottom:8px}
+  .tools button{padding:6px 9px}
+  .foot{gap:8px}
   .actions{margin-bottom:8px}
   .btn{padding:11px 8px;font-size:14px}
   .actions .btn.small{padding:11px 0;font-size:16px}
@@ -494,7 +638,7 @@ h1{font-size:17px;margin:0;font-weight:650;letter-spacing:.2px}
 <main class="card">
   <div class="head">
     <div class="logo">🎵</div>
-    <div><h1>媒体控制</h1><p class="muted">Windows 媒体桥</p></div>
+    <div><h1>媒体控制</h1><p class="muted">DSH · Windows 媒体桥</p></div>
     <span id="badge" class="badge">加载中</span>
   </div>
   <div class="body">
@@ -510,11 +654,39 @@ h1{font-size:17px;margin:0;font-weight:650;letter-spacing:.2px}
         <input id="seek" type="range" min="0" max="1" step="1" value="0" disabled aria-label="播放进度">
         <span id="posTxt" class="muted">--:-- / --:--</span>
       </div>
-      <div class="vol">
-        <span id="volIcon" title="系统音量">🔊</span>
-        <input id="vol" type="range" min="0" max="100" step="1" value="30" aria-label="系统音量">
-        <span id="volVal" class="muted">--%</span>
+      <div class="vols">
+        <div class="vrow">
+          <span class="vlabel">视频</span>
+          <button id="vvolDown" class="volbtn" title="视频音量 -1" aria-label="视频音量减一">−</button>
+          <input id="vvol" type="range" min="0" max="100" step="1" value="100" aria-label="视频音量">
+          <span id="vvolVal" class="vv">--%</span>
+          <button id="vvolUp" class="volbtn" title="视频音量 +1" aria-label="视频音量加一">+</button>
+        </div>
+        <div class="vrow">
+          <span class="vlabel">系统</span>
+          <button id="volDown" class="volbtn" title="系统音量 -1" aria-label="系统音量减一">−</button>
+          <input id="vol" type="range" min="0" max="100" step="1" value="30" aria-label="系统音量">
+          <span id="volVal" class="vv">--%</span>
+          <button id="volUp" class="volbtn" title="系统音量 +1" aria-label="系统音量加一">+</button>
+        </div>
       </div>
+      <div class="tools">
+        <select id="speed" aria-label="倍速">
+          <option value="0.75">0.75x</option>
+          <option value="1">1x</option>
+          <option value="1.25">1.25x</option>
+          <option value="1.5">1.5x</option>
+          <option value="2">2x</option>
+        </select>
+        <button id="viewBtn" title="网页全屏">网页全屏</button>
+        <button id="dmBtn" title="弹幕开关">弹幕</button>
+        <label><input id="autoNext" type="checkbox" checked>连播</label>
+        <button id="collBtn" title="把当前合集/分P加入队列">合集</button>
+        <button id="eqBtn" title="响度均衡">均衡</button>
+        <button id="qbtn" title="查看队列">队列</button>
+        <span id="qinfo"></span>
+      </div>
+      <div id="queueBox" class="queuebox" hidden></div>
       <div class="actions">
         <button id="prev" class="btn small" title="上一首">⏮</button>
         <button id="play" class="btn">▶ 播放</button>
@@ -526,6 +698,7 @@ h1{font-size:17px;margin:0;font-weight:650;letter-spacing:.2px}
         <label class="sleep">定时暂停
           <select id="sleep" aria-label="定时暂停">
             <option value="0">关</option>
+            <option value="1">1 分钟</option>
             <option value="15">15 分钟</option>
             <option value="30">30 分钟</option>
             <option value="45">45 分钟</option>
@@ -538,12 +711,17 @@ h1{font-size:17px;margin:0;font-weight:650;letter-spacing:.2px}
       </div>
       <div class="foot">
         <button id="refresh" class="link">刷新</button>
+        <button id="mineLater" class="link">稍后再看</button>
+        <button id="mineHist" class="link">历史</button>
+        <button id="mineFav" class="link">收藏夹</button>
+        <a class="link" href="/voice">语音测试</a>
         <span id="msg" class="muted"></span>
       </div>
     </div>
     <div class="browse">
       <div class="search">
         <input id="q" placeholder="搜 B站 歌单 / 歌曲" autocomplete="off">
+        <label><input id="music" type="checkbox" checked>音乐区</label>
         <button id="searchBtn">搜索</button>
       </div>
       <div class="refreshbar">
@@ -609,7 +787,14 @@ function render(d){
   $('app').textContent = d.app || '';
   $('wakeBox').classList.remove('show');
   showVol(d.volume);
+  showVVol(d.vvol);
   showMute(d.muted);
+  const q = d.queue || {};
+  $('qinfo').textContent = q.n ? ((((q.idx|0) + 1)) + '/' + q.n + (q.next ? ' · 下一条 ' + q.next : '')) : '';
+  $('autoNext').checked = q.auto !== false;
+  if(d.rate) $('speed').value = String(d.rate);
+  if(d.dm !== null && d.dm !== undefined) $('dmBtn').textContent = d.dm ? '弹幕开' : '弹幕关';
+  if(d.eq !== null && d.eq !== undefined) $('eqBtn').textContent = d.eq ? '均衡开' : '均衡';
   renderProgress(d.pos, d.dur);
   sleepDue = d.sleep_due || 0;
   const offline = d.pc_online === false;
@@ -653,13 +838,11 @@ const vol = $('vol');
 let volDragging = false;
 let volTimer = null;
 let volPending = null;
-function volIcon(v){ return v <= 0 ? '🔇' : (v < 50 ? '🔉' : '🔊'); }
 function showVol(v){
-  if(v === null || v === undefined || volDragging) return;
+  if(v === null || v === undefined || volDragging || volPending !== null) return;
   v = Math.max(0, Math.min(100, Math.round(Number(v))));
   vol.value = v;
   $('volVal').textContent = v + '%';
-  $('volIcon').textContent = volIcon(v);
 }
 async function sendVol(){
   const v = Number(vol.value);
@@ -668,21 +851,68 @@ async function sendVol(){
     const d = await post('/api/volume', 'level=' + v);
     if(!d) return;
     if(!d.ok) msg(d.error || '音量调整失败');
-    else if(volPending === v){ $('volVal').textContent = d.volume + '%'; $('volIcon').textContent = volIcon(d.volume); }
+    else if(volPending === v){ vol.value = d.volume; $('volVal').textContent = d.volume + '%'; }
   } catch(e){ msg('音量请求失败'); }
+  finally { if(volPending === v) volPending = null; }
 }
 vol.addEventListener('pointerdown', () => { volDragging = true; });
 addEventListener('pointerup', () => { volDragging = false; });
 vol.addEventListener('input', () => {
   const v = Number(vol.value);
   $('volVal').textContent = v + '%';
-  $('volIcon').textContent = volIcon(v);
   clearTimeout(volTimer);
   volTimer = setTimeout(sendVol, 250);
 });
 vol.addEventListener('change', () => { clearTimeout(volTimer); sendVol(); });
+function nudgeVol(d){
+  vol.value = Math.max(0, Math.min(100, Number(vol.value) + d));
+  vol.dispatchEvent(new Event('input'));
+}
+$('volDown').addEventListener('click', () => nudgeVol(-1));
+$('volUp').addEventListener('click', () => nudgeVol(1));
+const vvol = $('vvol');
+let vvolDragging = false;
+let vvolTimer = null;
+let vvolPending = null;
+function showVVol(v){
+  if(v === null || v === undefined || vvolDragging || vvolPending !== null) return;
+  v = Math.max(0, Math.min(100, Math.round(Number(v))));
+  vvol.value = v;
+  $('vvolVal').textContent = v + '%';
+}
+async function sendVVol(){
+  const v = Number(vvol.value);
+  vvolPending = v;
+  try {
+    const d = await post('/api/vvol', 'level=' + v);
+    if(!d) return;
+    if(!d.ok) msg(d.error || '视频音量失败');
+    else if(vvolPending === v && d.vvol !== null && d.vvol !== undefined){
+      vvol.value = d.vvol;
+      $('vvolVal').textContent = d.vvol + '%';
+    }
+  } catch(e){ msg('视频音量请求失败'); }
+  finally { if(vvolPending === v) vvolPending = null; }
+}
+vvol.addEventListener('pointerdown', () => { vvolDragging = true; });
+addEventListener('pointerup', () => { vvolDragging = false; });
+vvol.addEventListener('input', () => {
+  const v = Number(vvol.value);
+  $('vvolVal').textContent = v + '%';
+  clearTimeout(vvolTimer);
+  vvolTimer = setTimeout(sendVVol, 250);
+});
+vvol.addEventListener('change', () => { clearTimeout(vvolTimer); sendVVol(); });
+function nudgeVVol(d){
+  vvol.value = Math.max(0, Math.min(100, Number(vvol.value) + d));
+  vvol.dispatchEvent(new Event('input'));
+}
+$('vvolDown').addEventListener('click', () => nudgeVVol(-1));
+$('vvolUp').addEventListener('click', () => nudgeVVol(1));
 let videoBusy = false;
+let currentList = [];
 function renderVideos(list){
+  currentList = Array.isArray(list) ? list : [];
   const box = $('results');
   box.textContent = '';
   if(!list || !list.length){
@@ -692,7 +922,9 @@ function renderVideos(list){
     box.appendChild(e);
     return;
   }
+  let vidx = -1;
   for(const v of list){
+    vidx++;
     const b = document.createElement('button');
     b.className = 'video';
     const img = document.createElement('img');
@@ -714,12 +946,19 @@ function renderVideos(list){
     sub.textContent = parts.join(' · ');
     meta.appendChild(t); meta.appendChild(sub);
     b.appendChild(img); b.appendChild(meta);
-    b.onclick = () => openVideo(v, b);
+    b.onclick = async () => {
+      try {
+        const payload = currentList.map(x => ({bv:x.bv, title:x.title || ''}));
+        await post('/api/queue/set', 'videos=' + encodeURIComponent(JSON.stringify(payload)) + '&idx=' + vidx);
+      } catch(e) {}
+      openVideo(v, b);
+    };
     box.appendChild(b);
   }
 }
 let lastQuery = '';
 let searchPage = 1;
+let listMode = 'search';
 let lastRefresh = 0;
 const AUTO_MS = 10 * 60 * 1000;
 function fmtTime(ts){
@@ -728,6 +967,7 @@ function fmtTime(ts){
 }
 function updateRefreshInfo(){
   const el = $('refreshInfo');
+  if(listMode !== 'search') return;
   if(!lastRefresh){ el.textContent = '—'; return; }
   const remain = Math.max(0, AUTO_MS - (Date.now() - lastRefresh));
   if(remain <= 0){ el.textContent = '上次 ' + fmtTime(lastRefresh) + ' · 即将刷新'; return; }
@@ -749,6 +989,7 @@ async function loadVideos(force, silent){
     const r = await fetch('/api/videos' + (force ? '?force=1' : ''), {cache:'no-store'});
     const d = await r.json();
     if(!d.ok){ msg(d.error || '加载失败'); if(!silent) renderVideos([]); updateRefreshInfo(); return; }
+    listMode = 'search';
     renderVideos(d.videos || []);
     lastRefresh = Date.now();
     lastQuery = '';
@@ -780,9 +1021,11 @@ async function searchVideos(opts){
     $('refreshInfo').textContent = '刷新中…';
   }
   try {
-    const r = await fetch('/api/search?q=' + encodeURIComponent(q) + '&page=' + searchPage, {cache:'no-store'});
+    const musicQ = ($('music') && $('music').checked) ? '&music=1&order=click' : '';
+    const r = await fetch('/api/search?q=' + encodeURIComponent(q) + '&page=' + searchPage + musicQ, {cache:'no-store'});
     const d = await r.json();
     if(!d.ok){ msg(d.error || '搜索失败'); if(!opts.silent) renderVideos([]); updateRefreshInfo(); return; }
+    listMode = 'search';
     renderVideos(d.videos || []);
     lastQuery = q;
     lastRefresh = Date.now();
@@ -812,13 +1055,129 @@ $('searchBtn').onclick = () => searchVideos();
 $('q').addEventListener('keydown', e => { if(e.key === 'Enter') searchVideos(); });
 $('pageBtn').onclick = nextPage;
 $('refreshBtn').onclick = manualRefresh;
+$('speed').addEventListener('change', async () => {
+  const v = $('speed').value;
+  const d = await post('/api/speed', 'rate=' + v);
+  if(d && d.ok) msg('倍速 ' + v + 'x'); else if(d) msg(d.error || '倍速失败');
+});
+$('viewBtn').onclick = async () => {
+  const d = await post('/api/view', 'mode=web');
+  msg(d && d.ok ? '已切换网页全屏' : (d ? d.error : '失败'));
+};
+$('dmBtn').onclick = async () => {
+  const on = !($('dmBtn').textContent || '').includes('开');
+  const d = await post('/api/danmaku', 'on=' + (on ? 1 : 0));
+  if(d && d.ok) $('dmBtn').textContent = d.danmaku ? '弹幕开' : '弹幕关';
+};
+$('autoNext').addEventListener('change', () => post('/api/queue/auto', 'on=' + ($('autoNext').checked ? 1 : 0)));
+async function renderQueue(){
+  const box = $('queueBox');
+  try {
+    const r = await fetch('/api/queue/status', {cache:'no-store'});
+    const d = await r.json();
+    box.textContent = '';
+    const q = d.queue || [];
+    if(!q.length){
+      const e = document.createElement('div'); e.className = 'tab-empty'; e.textContent = '队列为空';
+      box.appendChild(e);
+    }
+    q.forEach((it, i) => {
+      const row = document.createElement('div');
+      row.className = 'qitem' + (i === d.idx ? ' cur' : '');
+      const s = document.createElement('span'); s.className = 'qi';
+      s.textContent = (i + 1) + '. ' + (it.title || it.bv) + (it.p > 1 ? ' P' + it.p : '');
+      const x = document.createElement('button'); x.className = 'qx'; x.textContent = '×';
+      x.onclick = async () => {
+        const r2 = await post('/api/queue/del', 'i=' + i);
+        if(r2 && r2.ok){ renderQueue(); refresh(); }
+      };
+      row.append(s, x); box.appendChild(row);
+    });
+    const act = document.createElement('div'); act.className = 'qactions';
+    const fill = document.createElement('button'); fill.textContent = '追加相关';
+    fill.onclick = async () => {
+      const r2 = await post('/api/queue/fill');
+      msg(r2 && r2.ok ? ('追加 ' + r2.added + ' 条') : '没有相关推荐');
+      renderQueue(); refresh();
+    };
+    const clear = document.createElement('button'); clear.textContent = '清空';
+    clear.onclick = async () => { await post('/api/queue/set', 'videos=[]&idx=0'); renderQueue(); refresh(); };
+    act.append(fill, clear); box.appendChild(act);
+  } catch(e) { msg('队列加载失败'); }
+}
+$('qbtn').onclick = async () => {
+  const box = $('queueBox');
+  box.hidden = !box.hidden;
+  if(!box.hidden) await renderQueue();
+};
+$('collBtn').onclick = async () => {
+  const d = await post('/api/queue/collection');
+  if(d && d.ok){ msg('合集 ' + d.n + ' 条，从第 ' + (d.idx + 1) + ' 条开始'); setTimeout(refresh, 800); }
+  else msg(d && d.error === 'no collection' ? '当前不是合集/多P' : (d ? d.error : '失败'));
+};
+$('eqBtn').onclick = async () => {
+  const on = !($('eqBtn').textContent || '').includes('开');
+  const d = await post('/api/eq', 'on=' + (on ? 1 : 0));
+  if(d && d.ok) $('eqBtn').textContent = d.eq ? '均衡开' : '均衡';
+  else msg(d ? (d.error || d.result || '均衡失败') : '均衡失败');
+};
+async function loadMine(kind){
+  try {
+    if(kind === 'fav'){
+      const r = await fetch('/api/bili/favs', {cache:'no-store'});
+      const d = await r.json();
+      if(!d.ok){ msg(d.error || '收藏夹加载失败'); return; }
+      renderFolders(d.folders || []);
+      return;
+    }
+    const r = await fetch(kind === 'hist' ? '/api/bili/history' : '/api/bili/watchlater', {cache:'no-store'});
+    const d = await r.json();
+    if(!d.ok){ msg(d.error || '加载失败'); return; }
+    showList(kind === 'hist' ? '历史' : '稍后再看', d.videos || []);
+  } catch(e) { msg('加载失败'); }
+}
+function showList(title, list){
+  listMode = 'list';
+  currentList = Array.isArray(list) ? list : [];
+  $('refreshInfo').textContent = title + ' · ' + currentList.length + ' 条';
+  renderVideos(currentList);
+}
+function renderFolders(folders){
+  listMode = 'folders';
+  const box = $('results');
+  box.textContent = '';
+  $('refreshInfo').textContent = '收藏夹 · ' + folders.length + ' 个';
+  if(!folders.length){
+    const e = document.createElement('div'); e.className = 'tab-empty'; e.textContent = '没有收藏夹';
+    box.appendChild(e); return;
+  }
+  for(const f of folders){
+    const b = document.createElement('button'); b.className = 'video';
+    const meta = document.createElement('div'); meta.className = 'meta';
+    const t = document.createElement('div'); t.className = 'vt';
+    t.textContent = (f.title || '收藏夹') + '（' + (f.count || 0) + '）';
+    meta.appendChild(t); b.appendChild(meta);
+    b.onclick = async () => {
+      const r = await fetch('/api/bili/fav?id=' + encodeURIComponent(f.id), {cache:'no-store'});
+      const d = await r.json();
+      if(!d.ok){ msg(d.error || '加载失败'); return; }
+      showList('收藏夹 ' + (f.title || ''), d.videos || []);
+    };
+    box.appendChild(b);
+  }
+}
+$('mineLater').onclick = () => loadMine('later');
+$('mineHist').onclick = () => loadMine('hist');
+$('mineFav').onclick = () => loadMine('fav');
 loadVideos(false, false);
 setInterval(() => {
-  if(document.hidden) return;
+  if(document.hidden || listMode !== 'search') return;
   if(lastRefresh && Date.now() - lastRefresh >= AUTO_MS) manualRefresh();
 }, 30000);
 document.addEventListener('visibilitychange', () => {
-  if(!document.hidden && lastRefresh && Date.now() - lastRefresh >= AUTO_MS) manualRefresh();
+  if(document.hidden) return;
+  if(!busy) refresh();
+  if(lastRefresh && Date.now() - lastRefresh >= AUTO_MS) manualRefresh();
 });
 async function sendSeek(){
   if(!seekDur || busy || $('seek').disabled) return;
@@ -878,14 +1237,234 @@ $('wake').onclick = async () => {
     }, 3000);
   } catch(e){ msg('唤醒请求失败'); }
 };
-$('prev').onclick = () => act('prev');
-$('next').onclick = () => act('next');
+$('prev').onclick = () => queueStep('prev');
+async function queueStep(dir){
+  if(busy) return;
+  busy = true;
+  msg(dir === 'next' ? '下一首…' : '上一首…');
+  try {
+    const d = await post('/api/queue/' + dir);
+    if(!d) return;
+    if(!d.ok) msg(d.error || '没有队列');
+    else { msg('队列 ' + (d.idx + 1) + '/' + d.n); setTimeout(refresh, 1500); }
+  } catch(e) { msg('请求失败'); }
+  finally { busy = false; }
+}
+$('next').onclick = () => queueStep('next');
 $('mute').onclick = () => act('mute');
 $('play').onclick = () => act('play');
 $('pause').onclick = () => act('pause');
 $('refresh').onclick = refresh;
 refresh();
-setInterval(() => { if(!busy) refresh(); }, 5000);
+setInterval(() => { if(!busy && !document.hidden) refresh(); }, 5000);
+</script>
+</body>
+</html>"""
+
+VOICE_PAGE = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>语音测试</title>
+<style>
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;background:#0b0f14;color:#e8eef5;font-family:system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans SC",sans-serif;padding:14px}
+.card{max-width:760px;margin:0 auto;background:#121922;border:1px solid #223042;border-radius:16px;padding:18px}
+.head{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+h1{font-size:17px;margin:0;flex:1}
+a{color:#7fb0ff;text-decoration:none;font-size:13px}
+.badge{font-size:12px;padding:4px 10px;border-radius:999px;background:#26313d}
+.badge.ok{background:#12351f;color:#6ee7a0}
+.badge.bad{background:#3a1717;color:#f28b82}
+.rows{display:grid;grid-template-columns:76px 1fr;gap:9px 10px;font-size:13px;margin:12px 0}
+.rows .k{color:#8fa1b3}
+.rows .v{word-break:break-word;min-width:0}
+.ph{margin:10px 0 4px}
+.big{width:100%;padding:16px;font-size:16px;touch-action:none;user-select:none;-webkit-user-select:none}
+.test{display:flex;gap:8px;margin:12px 0;flex-wrap:wrap}
+.test input{flex:1 1 100%;background:#0d141c;border:1px solid #223042;border-radius:10px;color:#e8eef5;padding:10px 12px;font-size:14px;outline:none}
+.test input:focus{border-color:#2563eb}
+button{border:1px solid #2a3a4d;background:#1a2634;color:#e8eef5;border-radius:10px;padding:10px 12px;font-size:13px;cursor:pointer}
+button.primary{background:#2563eb;border-color:#2563eb;color:#fff}
+button:disabled{opacity:.4}
+.btns{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 6px}
+.ev{border-top:1px solid #1d2a38;padding:7px 0;font-size:12px;color:#c7d2de;display:flex;gap:8px}
+.ev .t{color:#64748b;flex:none;font-variant-numeric:tabular-nums}
+.ev .e{color:#7fb0ff;flex:none;width:56px}
+.ev .v{min-width:0;word-break:break-word}
+.note{color:#64748b;font-size:11px;line-height:1.5;margin-top:12px}
+@media (min-width:560px){.rows{grid-template-columns:86px 1fr}.test input{flex:1 1 auto}}
+</style>
+</head>
+<body>
+<main class="card">
+  <div class="head">
+    <h1>🎤 语音测试</h1>
+    <span id="badge" class="badge">加载中</span>
+    <a href="/">返回</a>
+  </div>
+  <div class="ph">
+    <button id="talk" class="primary big">按住说话（手机麦克风）</button>
+    <div id="phInfo" class="muted">按住按钮说话，松开后识别并执行</div>
+  </div>
+  <div class="rows">
+    <span class="k">手机识别</span><span class="v" id="sPhone">—</span>
+    <span class="k">监听</span><span class="v" id="sOn">—</span>
+    <span class="k">模型</span><span class="v" id="sReady">—</span>
+    <span class="k">最后识别</span><span class="v" id="sText">—</span>
+    <span class="k">命中命令</span><span class="v" id="sCmd">—</span>
+    <span class="k">最后动作</span><span class="v" id="sAct">—</span>
+    <span class="k">回执</span><span class="v" id="sAck">—</span>
+  </div>
+  <div class="test">
+    <input id="q" value="电脑帮我换周杰伦的歌" autocomplete="off">
+    <button id="dry">只解析</button>
+    <button id="run" class="primary">执行</button>
+  </div>
+  <div class="btns">
+    <button id="ack">重放「我在呢」</button>
+    <button id="toggle">关闭监听</button>
+  </div>
+  <div id="events"></div>
+  <div class="note">识别 → 命令解析 → B站搜索第一条播放。点「执行」会切换电脑当前播放的歌曲。</div>
+</main>
+<script nonce="__NONCE__">
+const CSRF = "__CSRF__";
+const $ = id => document.getElementById(id);
+let on = true;
+function fmtTs(s){ if(!s) return ''; const d = new Date(s*1000); return d.toTimeString().slice(0,8); }
+function show(d){
+  const v = d.voice || {};
+  on = !!v.on;
+  $('badge').textContent = v.ready ? (v.on ? '监听中' : '已暂停') : (v.error ? '异常' : '加载中');
+  $('badge').className = 'badge ' + (v.ready && v.on ? 'ok' : 'bad');
+  $('sOn').textContent = v.on ? '开启' : '关闭';
+  $('sReady').textContent = v.ready ? ('就绪 · 设备' + v.device) : (v.error || '未就绪');
+  $('sText').textContent = v.last_text || '—';
+  const c = v.last_cmd;
+  $('sCmd').textContent = c ? ((c.kind === 'next' ? '下一首' : ('搜索 ' + c.q)) + ' · ' + (c.text || '')) : '—';
+  const a = v.last_action;
+  $('sAct').textContent = a ? (a.kind === 'search' ? ('搜索 ' + a.q + (a.ok ? ' → ' + (a.title || a.bv || '') : ' 失败')) : (a.kind === 'next' ? '下一首' : a.kind)) + (a.ok === false ? '（失败）' : '') : '—';
+  $('sAck').textContent = v.last_ack ? fmtTs(v.last_ack) + ' 播放过' : '—';
+  $('toggle').textContent = v.on ? '关闭监听' : '开启监听';
+  const box = $('events');
+  box.textContent = '';
+  for(const e of (v.events || []).slice().reverse().slice(0, 15)){
+    const row = document.createElement('div'); row.className = 'ev';
+    const t = document.createElement('span'); t.className = 't'; t.textContent = fmtTs(e.ts);
+    const k = document.createElement('span'); k.className = 'e'; k.textContent = e.ev;
+    const x = document.createElement('span'); x.className = 'v';
+    x.textContent = e.text || e.q || e.say || (e.ok !== undefined ? (e.ok ? 'ok' : 'fail') : '') || e.err || '';
+    row.append(t, k, x); box.appendChild(row);
+  }
+}
+async function post(url, body){
+  const r = await fetch(url, {method:'POST', headers:{'X-CSRF-Token':CSRF, 'Content-Type':'application/x-www-form-urlencoded'}, body: body || ''});
+  if(r.status === 403){ location.reload(); return null; }
+  return r.json();
+}
+async function refresh(){
+  try { const r = await fetch('/api/voice', {cache:'no-store'}); const d = await r.json(); if(d.ok) show(d); else { $('badge').textContent = '桥不可达'; $('badge').className = 'badge bad'; } }
+  catch(e) { $('badge').textContent = '请求失败'; $('badge').className = 'badge bad'; }
+}
+$('dry').addEventListener('click', async () => {
+  if(!$('q').value.trim()){ alert('先输入命令'); return; }
+  const d = await post('/api/voice/test', 'q=' + encodeURIComponent($('q').value) + '&dry=1');
+  if(d && d.cmd) alert('解析结果：' + (d.cmd.kind === 'next' ? '下一首' : d.cmd.q));
+  else if(d) alert(d.error || '不是命令');
+  refresh();
+});
+$('run').addEventListener('click', async () => {
+  if(!$('q').value.trim()){ alert('先输入命令'); return; }
+  if(!confirm('会切换当前播放，继续？')) return;
+  const d = await post('/api/voice/test', 'q=' + encodeURIComponent($('q').value) + '&dry=0');
+  if(d && !d.ok) alert(d.error || '失败');
+  setTimeout(refresh, 1500);
+});
+$('ack').addEventListener('click', async () => { await post('/api/voice/ack'); setTimeout(refresh, 800); });
+$('toggle').addEventListener('click', async () => { await post('/api/voice/on', 'on=' + (on ? '0' : '1')); setTimeout(refresh, 500); });
+const media = {stream:null, ac:null, src:null, proc:null, chunks:[], on:false};
+const PUB = "__PUBLIC_URL__";
+const talk = $('talk');
+if(!window.isSecureContext){
+  talk.disabled = true;
+  if(PUB && !location.href.startsWith(PUB)){ location.replace(PUB + 'voice'); }
+  else if(PUB) $('phInfo').innerHTML = '局域网 HTTP 不能开麦克风，<a href="' + PUB + 'voice" style="color:#7fb0ff">点这里用 HTTPS 打开</a>';
+  else $('phInfo').textContent = '手机麦克风需要 HTTPS 页面（请用公网地址打开）';
+}
+async function startTalk(e){
+  e.preventDefault();
+  if(media.on || talk.disabled) return;
+  try {
+    try {
+      media.stream = await navigator.mediaDevices.getUserMedia({audio:{channelCount:1, echoCancellation:true, noiseSuppression:true}});
+    } catch(firstErr) {
+      media.stream = await navigator.mediaDevices.getUserMedia({audio:true});
+    }
+    media.ac = new (window.AudioContext || window.webkitAudioContext)();
+    media.src = media.ac.createMediaStreamSource(media.stream);
+    media.proc = media.ac.createScriptProcessor(4096, 1, 1);
+    media.chunks = [];
+    media.proc.onaudioprocess = ev => {
+      if(!media.on) return;
+      const d = ev.inputBuffer.getChannelData(0);
+      const a = new Int16Array(d.length);
+      for(let i=0;i<d.length;i++){ let s = Math.max(-1, Math.min(1, d[i])); a[i] = s < 0 ? s*32768 : s*32767; }
+      media.chunks.push(a);
+    };
+    media.src.connect(media.proc);
+    media.proc.connect(media.ac.destination);
+    media.on = true;
+    talk.textContent = '松开发送…';
+    $('phInfo').textContent = '录音中…';
+  } catch(err) {
+    $('phInfo').textContent = '麦克风不可用：' + err.message;
+  }
+}
+async function stopTalk(){
+  if(!media.on) return;
+  media.on = false;
+  talk.textContent = '按住说话';
+  const rate = media.ac ? media.ac.sampleRate : 16000;
+  try {
+    media.proc.disconnect(); media.src.disconnect();
+    media.stream.getTracks().forEach(t => t.stop());
+    if(media.ac) media.ac.close();
+  } catch(err) {}
+  let total = 0;
+  for(const c of media.chunks) total += c.length;
+  if(total < 4000){ $('phInfo').textContent = '录音太短，再说一次'; return; }
+  const pre = Math.floor(rate * 0.15);
+  const post = Math.floor(rate * 0.20);
+  const bytes = new Uint8Array((total + pre + post) * 2);
+  const dv = new DataView(bytes.buffer);
+  let off = pre * 2;
+  for(const c of media.chunks){
+    for(let i=0;i<c.length;i++){ dv.setInt16(off, c[i], true); off += 2; }
+  }
+  media.chunks = [];
+  $('phInfo').textContent = '识别中…';
+  try {
+    const r = await fetch('/api/voice/audio?rate=' + rate, {
+      method:'POST',
+      headers:{'X-CSRF-Token':CSRF, 'Content-Type':'application/octet-stream'},
+      body: bytes
+    });
+    const d = await r.json();
+    $('sPhone').textContent = (d.text || '（无结果）') +
+      (d.cmd ? ' → ' + (d.cmd.kind === 'next' ? '下一首' : ('搜索 ' + d.cmd.q)) : '（非命令）');
+    $('phInfo').textContent = d.ok ? '完成' : (d.error || '失败');
+    refresh();
+  } catch(err) {
+    $('phInfo').textContent = '上传失败：' + err.message;
+  }
+}
+talk.addEventListener('pointerdown', startTalk);
+addEventListener('pointerup', stopTalk);
+setInterval(refresh, 2000);
+refresh();
 </script>
 </body>
 </html>"""
@@ -917,8 +1496,6 @@ class Handler(BaseHTTPRequestHandler):
         return f"{exp}.{sig}"
 
     def _auth(self) -> bool:
-        if not USER or not PASSWORD:
-            return False
         if self._cookie_ok():
             return True
         h = self.headers.get("Authorization", "")
@@ -1050,8 +1627,10 @@ class Handler(BaseHTTPRequestHandler):
             html = PAGE.replace("__NONCE__", nonce).replace("__CSRF__", CSRF)
             self._send(200, html.encode("utf-8"), "text/html; charset=utf-8", nonce=nonce)
             return
-        if path not in ("/", "/index.html", "/api/status", "/api/health", "/api/pc",
-                        "/api/tabs", "/api/videos", "/api/search"):
+        if path not in ("/", "/index.html", "/api/status", "/api/health", "/api/pc", "/api/climate",
+                        "/api/tabs", "/api/videos", "/api/search", "/api/voice", "/voice",
+                        "/api/queue/status", "/api/bili/watchlater", "/api/bili/history",
+                        "/api/bili/favs", "/api/bili/fav"):
             self._json({"ok": False, "error": "not found"}, 404)
             return
         if not self._guard():
@@ -1064,8 +1643,25 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/health":
             self._json({"ok": True})
             return
+        if path == "/voice":
+            nonce = secrets.token_urlsafe(16)
+            html = VOICE_PAGE.replace("__NONCE__", nonce).replace("__CSRF__", CSRF).replace("__PUBLIC_URL__", PUBLIC_URL)
+            self._send(200, html.encode("utf-8"), "text/html; charset=utf-8", nonce=nonce)
+            return
+        if path == "/api/voice":
+            try:
+                self._json(_bridge("voice/status"))
+            except Exception as exc:
+                self._json({"ok": False, "error": str(exc)}, 502)
+            return
         if path == "/api/pc":
             self._json({"ok": True, "online": _pc_online(), "wol": bool(WIN_MAC)})
+            return
+        if path == "/api/climate":
+            try:
+                self._json(_climate())
+            except Exception as exc:
+                self._json({"ok": False, "error": str(exc)}, 502)
             return
         if path == "/api/tabs":
             force = (parse_qs(parsed.query).get("force") or [""])[0] == "1"
@@ -1082,17 +1678,53 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": False, "error": str(exc)}, 502)
             return
         if path == "/api/search":
-            q = (parse_qs(parsed.query).get("q") or [""])[0].strip()
+            qs = parse_qs(parsed.query)
+            q = (qs.get("q") or [""])[0].strip()
             if not q:
                 self._json({"ok": False, "error": "empty query"}, 400)
                 return
             try:
-                page = int((parse_qs(parsed.query).get("page") or ["1"])[0])
+                page = int((qs.get("page") or ["1"])[0])
             except ValueError:
                 page = 1
             page = max(1, min(50, page))
+            music = (qs.get("music") or [""])[0] in ("1", "true")
+            order = (qs.get("order") or [""])[0]
             try:
-                self._json(_search(q, page))
+                self._json(_search(q, page, music=music, order=order))
+            except Exception as exc:
+                self._json({"ok": False, "error": str(exc)}, 502)
+            return
+        if path == "/api/queue/status":
+            try:
+                self._json(_bridge("queue/status"))
+            except Exception as exc:
+                self._json({"ok": False, "error": str(exc)}, 502)
+            return
+        if path in ("/api/bili/watchlater", "/api/bili/history"):
+            try:
+                self._json(_bridge("bili/" + path.rsplit("/", 1)[-1]))
+            except Exception as exc:
+                self._json({"ok": False, "error": str(exc)}, 502)
+            return
+        if path == "/api/bili/favs":
+            try:
+                self._json(_bridge("bili/favs"))
+            except Exception as exc:
+                self._json({"ok": False, "error": str(exc)}, 502)
+            return
+        if path == "/api/bili/fav":
+            qs = parse_qs(parsed.query)
+            try:
+                fid = int((qs.get("id") or ["0"])[0])
+                page = int((qs.get("page") or ["1"])[0])
+            except ValueError:
+                fid, page = 0, 1
+            if fid <= 0:
+                self._json({"ok": False, "error": "bad id"}, 400)
+                return
+            try:
+                self._json(_bridge("bili/fav?id=%d&page=%d" % (fid, max(1, page))))
             except Exception as exc:
                 self._json({"ok": False, "error": str(exc)}, 502)
             return
@@ -1106,20 +1738,29 @@ class Handler(BaseHTTPRequestHandler):
         action = path.rsplit("/", 1)[-1]
         if path not in ("/api/pause", "/api/play", "/api/next", "/api/prev", "/api/mute",
                         "/api/volume", "/api/seek", "/api/sleep", "/api/wake",
-                        "/api/tab", "/api/open"):
+                        "/api/tab", "/api/open",
+                        "/api/voice/test", "/api/voice/ack", "/api/voice/on",
+                        "/api/voice/audio", "/api/queue/next", "/api/queue/prev",
+                        "/api/queue/auto", "/api/queue/set", "/api/speed", "/api/vvol",
+                        "/api/view", "/api/danmaku", "/api/eq", "/api/queue/add", "/api/queue/del",
+                        "/api/queue/fill", "/api/queue/collection"):
             self._json({"ok": False, "error": "not found"}, 404)
             return
-        if action not in ("volume", "tab", "open", "seek", "sleep", "wake") and action not in ACTIONS:
+        if action not in ("volume", "tab", "open", "seek", "sleep", "wake", "test", "ack", "on", "audio",
+                          "next", "prev", "auto", "set", "speed", "vvol", "view", "danmaku",
+                          "add", "del", "fill", "collection", "eq") and action not in ACTIONS:
             self._json({"ok": False, "error": "not found"}, 404)
             return
         try:
             length = int(self.headers.get("Content-Length") or "0")
         except ValueError:
             length = 0
-        if length > 1024:
+        max_len = 3 * 1024 * 1024 if path == "/api/voice/audio" else (16 * 1024 if path in ("/api/queue/set", "/api/queue/add") else 1024)
+        if length > max_len:
             self._json({"ok": False, "error": "body too large"}, 413)
             return
-        raw = self.rfile.read(length).decode("utf-8", "replace") if length else ""
+        raw_bytes = self.rfile.read(length) if length else b""
+        raw = raw_bytes.decode("utf-8", "replace")
         if not self._guard():
             return
         if not hmac.compare_digest(self.headers.get("X-CSRF-Token", ""), CSRF):
@@ -1176,7 +1817,7 @@ class Handler(BaseHTTPRequestHandler):
                 minutes = int((parse_qs(raw).get("min") or [""])[0])
             except ValueError:
                 minutes = None
-            if minutes not in (0, 15, 30, 45, 60, 90, 120):
+            if minutes not in (0, 1, 15, 30, 45, 60, 90, 120):
                 self._json({"ok": False, "error": "bad minutes"}, 400)
                 return
         if not _ACTION_LOCK.acquire(blocking=False):
@@ -1199,6 +1840,99 @@ class Handler(BaseHTTPRequestHandler):
                     "tab": data.get("tab"),
                     "error": data.get("error"),
                 })
+            elif action == "audio":
+                q = parse_qs(urlsplit(self.path).query)
+                try:
+                    rate = int((q.get("rate") or ["16000"])[0])
+                except ValueError:
+                    rate = 0
+                if not 8000 <= rate <= 96000:
+                    self._json({"ok": False, "error": "bad rate"}, 400)
+                    return
+                dry = (q.get("dry") or ["0"])[0] in ("1", "true")
+                data = _bridge_post("voice/audio?rate=%d&dry=%s" % (rate, "1" if dry else "0"),
+                                    raw_bytes, "application/octet-stream")
+                data["action"] = "audio"
+                self._json(data)
+            elif action == "test":
+                q = parse_qs(raw)
+                text = (q.get("q") or [""])[0].strip()
+                dry = (q.get("dry") or ["0"])[0] in ("1", "true")
+                if not text:
+                    self._json({"ok": False, "error": "empty q"}, 400)
+                    return
+                data = _bridge("voice/test?q=%s&dry=%s" % (quote(text), "1" if dry else "0"))
+                data["action"] = "test"
+                self._json(data)
+            elif action == "ack":
+                data = _bridge("voice/ack")
+                data["action"] = "ack"
+                self._json(data)
+            elif action == "on":
+                on = (parse_qs(raw).get("on") or ["1"])[0]
+                data = _bridge("voice?on=%s" % ("0" if on in ("0", "false", "off") else "1"))
+                data["action"] = "on"
+                self._json(data)
+            elif action in ("next", "prev"):
+                data = _bridge("queue/" + action)
+                data["action"] = action
+                self._json(data)
+            elif action == "auto":
+                on = (parse_qs(raw).get("on") or ["1"])[0]
+                data = _bridge("queue/auto?on=" + ("0" if on in ("0", "false", "off") else "1"))
+                data["action"] = "auto"
+                self._json(data)
+            elif action == "set":
+                q = parse_qs(raw)
+                videos = (q.get("videos") or ["[]"])[0]
+                idx = (q.get("idx") or ["0"])[0]
+                data = _bridge("queue/set?videos=" + quote(videos) + "&idx=" + quote(idx))
+                data["action"] = "set"
+                self._json(data)
+            elif action == "eq":
+                on = (parse_qs(raw).get("on") or ["1"])[0]
+                data = _bridge("cdp/eq?on=" + ("1" if on in ("1", "true", "on") else "0"))
+                data["action"] = "eq"
+                self._json(data)
+            elif action == "add":
+                q = parse_qs(raw)
+                videos = (q.get("videos") or ["[]"])[0]
+                data = _bridge("queue/add?videos=" + quote(videos))
+                data["action"] = "add"
+                self._json(data)
+            elif action == "del":
+                i = (parse_qs(raw).get("i") or ["-1"])[0]
+                data = _bridge("queue/del?i=" + quote(i))
+                data["action"] = "del"
+                self._json(data)
+            elif action == "fill":
+                data = _bridge("queue/fill")
+                data["action"] = "fill"
+                self._json(data)
+            elif action == "collection":
+                data = _bridge("queue/collection")
+                data["action"] = "collection"
+                self._json(data)
+            elif action == "speed":
+                rate = (parse_qs(raw).get("rate") or ["1"])[0]
+                data = _bridge("cdp/speed?rate=" + quote(rate))
+                data["action"] = "speed"
+                self._json(data)
+            elif action == "vvol":
+                level2 = (parse_qs(raw).get("level") or ["100"])[0]
+                data = _bridge("cdp/volume?level=" + quote(level2))
+                data["action"] = "vvol"
+                self._json(data)
+            elif action == "view":
+                mode = (parse_qs(raw).get("mode") or ["web"])[0]
+                data = _bridge("cdp/view?mode=" + quote(mode))
+                data["action"] = "view"
+                self._json(data)
+            elif action == "danmaku":
+                on = (parse_qs(raw).get("on") or ["1"])[0]
+                data = _bridge("cdp/danmaku?on=" + ("1" if on in ("1", "true", "on") else "0"))
+                data["action"] = "danmaku"
+                self._json(data)
             elif action == "volume":
                 data = _set_volume(level)
                 self._json({
