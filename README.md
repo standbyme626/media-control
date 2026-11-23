@@ -30,6 +30,7 @@ Edge（受控实例，--remote-debugging-port=9222）→ B 站播放器
 | 浏览 | 关键词搜索（音乐区过滤、按播放量/最新排序、翻页）、稍后再看、历史、收藏夹 |
 | 语音 | Windows 本地识别（sherpa-onnx + silero VAD + Vosk 关键词）：唤醒词、"下一首"、"放一首 XX"，说话时自动压低音乐 |
 | 锁屏 | Android 壳 1.9+ 提供系统媒体会话：锁屏 / 通知栏 / 蓝牙耳机按键都能 上/下一首、播放/暂停 |
+| 设备 | ESP32-S3 薄客户端（[nicemcu-desktop](https://github.com/standbyme626/nicemcu-desktop)）：封面 / 标题 / 进度 / 队列 / 遥控 |
 | 其他 | 局域网内可唤醒电脑（WOL）、可选温湿度卡片、飞书扫码登录、一次性 H5 链接 |
 
 ## 快速开始
@@ -123,7 +124,8 @@ sudo systemctl enable --now media-web
 
 ## HTTP API
 
-除 `/feishu*`、`/h5*` 外都要求认证；写操作还要带页面下发的 `X-CSRF-Token`。
+除 `/feishu*`、`/h5*` 外都要求认证；浏览器 Cookie 流程的写操作还要带页面下发的 `X-CSRF-Token`。  
+HTTP Basic 认证的 POST（设备/脚本，不携带浏览器 Cookie）免 CSRF；`/api/status` 增加 `bv` 字段供设备取封面。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -134,6 +136,8 @@ sudo systemctl enable --now media-web
 | GET | `/api/tabs` `/api/videos` | 受控浏览器的标签页 / 当前页视频卡片 |
 | GET | `/api/search?q=&page=&music=1&order=` | 搜索 |
 | GET | `/api/queue/status`、`/api/bili/{watchlater,history,favs,fav}` | 队列与 B 站个人列表 |
+| GET | `/api/cover?bv=` | 80×80 RGB565 封面原始字节（设备薄客户端，3.6.0） |
+| GET | `/api/queue/jump?i=` | 切到队列第 i 条并打开（设备薄客户端，3.6.0） |
 | POST | `/api/{play,pause,next,prev,mute,volume,seek,speed,vvol,view,danmaku,eq}` | 播放控制 |
 | POST | `/api/{queue/set,queue/add,queue/del,queue/fill,queue/collection,queue/next,queue/prev,queue/auto}` | 队列 |
 | POST | `/api/{sleep,wake,tab,open}` | 定时暂停 / 唤醒 / 切标签 / 按 BV 打开 |
@@ -180,6 +184,7 @@ python3 -m pytest tests -q          # 22 项：服务端行为 + 桥纯函数
 
 ## 版本记录
 
+- **3.6.0**（2026-11-23）：新增设备薄客户端接口 `GET /api/cover?bv=`（80×80 RGB565）、`GET /api/queue/jump?i=`；`/api/status` 增加 `bv`；Basic 认证 POST 免 CSRF（浏览器 Cookie 流程仍强制）；配套 ESP32 固件 [nicemcu-desktop](https://github.com/standbyme626/nicemcu-desktop)。
 - **3.5.1**（2026-11-19）：壳内不再重复注册浏览器媒体会话（避免和原生抢媒体键）；通知栏/锁屏媒体卡实测打通。
 - **3.5.0**（2026-11-19）：桥改多线程 + 状态快照缓存；`/api/status` 0.8s 缓存；进度条本地外推；轮询自适应；登录失败锁定、真实 IP、先鉴权后读 body、HSTS；搜索/播放改用专属标签页；状态原子落盘；APK 1.9 加入锁屏媒体会话；补 22 项测试与部署脚本。
 - **3.4.x**：B 站控制增强（双音量/队列连播/倍速/续播/全屏/弹幕/收藏夹）、本地语音识别。

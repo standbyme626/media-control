@@ -66,11 +66,11 @@ def test_http_auth_and_csrf(monkeypatch, tmp_path, fake_bridge):
         assert code == 401
         code, _, body = http(base + "/api/status", headers={"Authorization": basic("media", "secret-pass")})
         assert code == 200 and json.loads(body)["ok"] is True
-        # 无 CSRF 的写操作必须被拒
+        # 设备薄客户端用 Basic（不带浏览器 Cookie），按设计免 CSRF；应放行到桥
         code, _, _ = http(base + "/api/pause", method="POST",
                           headers={"Authorization": basic("media", "secret-pass")})
-        assert code == 403
-        # 带对 CSRF 才放行（这里 pause 会走桥，假桥返回 not found → 502/200 均可，只要不是 403）
+        assert code != 403
+        # 带对 CSRF 也放行（这里 pause 会走桥，假桥返回 not found → 502/200 均可，只要不是 403）
         code, _, _ = http(base + "/api/pause", method="POST",
                           headers={"Authorization": basic("media", "secret-pass"),
                                    "X-CSRF-Token": mod.CSRF})

@@ -101,7 +101,7 @@ _SLEEP_LOCK = threading.Lock()
 _RATE: dict[str, deque] = defaultdict(deque)
 _RATE_LOCK = threading.Lock()
 _ACTION_LOCK = threading.Lock()
-VERSION = "3.5.1"
+VERSION = "3.6.0"
 START_TS = time.time()
 STATUS_TTL = float(os.environ.get("MEDIA_STATUS_TTL", "0.8"))
 _STATUS = {"ts": 0.0, "data": None}     # /api/status 短 TTL 缓存
@@ -239,6 +239,57 @@ def _status_error(reason: str, error: str, pc_online) -> dict:
             "sleep_due": _sleep_due(), "updated": int(time.time())}
 
 
+
+BV_RE = re.compile(r"BV[0-9A-Za-z]{10}")
+COVER_SIZE = 80
+COVER_DIR = pathlib.Path("/tmp/media-web-covers")
+COVER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
+
+
+def _bv_from_url(url: str) -> str:
+    m = re.search(r"BV[0-9A-Za-z]{10}", url or "")
+    return m.group(0) if m else ""
+
+
+def _cover_bytes(bv: str) -> bytes:
+    COVER_DIR.mkdir(parents=True, exist_ok=True)
+    cache = COVER_DIR / (bv + ".rgb")
+    try:
+        if cache.exists() and time.time() - cache.stat().st_mtime < 86400:
+            return cache.read_bytes()
+    except Exception:
+        pass
+    req = urllib.request.Request(
+        "https://api.bilibili.com/x/web-interface/view?bvid=" + bv,
+        headers={"User-Agent": COVER_UA, "Referer": "https://www.bilibili.com/"},
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        payload = json.loads(resp.read().decode("utf-8", "replace"))
+    pic = ((payload.get("data") or {}).get("pic") or "").replace("http://", "https://")
+    if not pic:
+        raise RuntimeError("no cover")
+    req2 = urllib.request.Request(pic, headers={"User-Agent": COVER_UA, "Referer": "https://www.bilibili.com/"})
+    with urllib.request.urlopen(req2, timeout=15) as resp:
+        raw = resp.read()
+    import io
+    from PIL import Image
+    im = Image.open(io.BytesIO(raw)).convert("RGB")
+    w, h = im.size
+    edge = min(w, h)
+    im = im.crop(((w - edge) // 2, (h - edge) // 2, (w + edge) // 2, (h + edge) // 2))
+    im = im.resize((COVER_SIZE, COVER_SIZE), Image.LANCZOS)
+    out = bytearray(COVER_SIZE * COVER_SIZE * 2)
+    i = 0
+    for r, g, b in im.getdata():
+        v = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+        out[i] = v & 0xFF
+        out[i + 1] = (v >> 8) & 0xFF
+        i += 2
+    data = bytes(out)
+    cache.write_bytes(data)
+    return data
+
+
 def _status_uncached() -> dict:
     online = _pc_online()
     if online is False:
@@ -256,6 +307,7 @@ def _status_uncached() -> dict:
             "volume": cdp.get("volume"),
             "muted": cdp.get("muted"),
             "url": cdp.get("url") or "",
+            "bv": _bv_from_url(cdp.get("url") or ""),
             "pos": cdp.get("t"),
             "dur": cdp.get("dur"),
             "backend": "cdp",
@@ -1885,7 +1937,7 @@ class Handler(BaseHTTPRequestHandler):
         if path not in ("/", "/index.html", "/api/status", "/api/health", "/api/pc", "/api/climate",
                         "/api/tabs", "/api/videos", "/api/search", "/api/voice", "/voice",
                         "/api/queue/status", "/api/bili/watchlater", "/api/bili/history",
-                        "/api/bili/favs", "/api/bili/fav"):
+                        "/api/bili/favs", "/api/bili/fav", "/api/cover", "/api/queue/jump"):
             self._json({"ok": False, "error": "not found"}, 404)
             return
         if not self._guard():
@@ -1927,6 +1979,37 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(_tabs(force))
             except Exception as exc:
                 self._json({"ok": False, "error": str(exc)}, 502)
+            return
+        if path == "/api/queue/jump":
+            try:
+                idx = int((parse_qs(parsed.query).get("i") or ["-1"])[0])
+            except ValueError:
+                idx = -1
+            try:
+                st = _bridge("queue/status")
+                q = st.get("queue") or []
+                if idx < 0 or idx >= len(q):
+                    self._json({"ok": False, "error": "bad index"}, 400)
+                    return
+                payload = [{"bv": x.get("bv"), "title": x.get("title")} for x in q]
+                _bridge("queue/set?" + urlencode({"videos": json.dumps(payload, ensure_ascii=False), "idx": idx}))
+                opened = _bridge("cdp/open?" + urlencode({"bv": q[idx].get("bv") or ""}))
+                self._json({"ok": bool(opened.get("ok", True)), "idx": idx,
+                            "bv": q[idx].get("bv"), "title": q[idx].get("title")})
+            except Exception as exc:
+                self._json({"ok": False, "error": str(exc)}, 502)
+            return
+        if path == "/api/cover":
+            bv = (parse_qs(parsed.query).get("bv") or [""])[0]
+            if not re.fullmatch(r"BV[0-9A-Za-z]{10}", bv):
+                self._json({"ok": False, "error": "bad bv"}, 400)
+                return
+            try:
+                data = _cover_bytes(bv)
+            except Exception as exc:
+                self._json({"ok": False, "error": str(exc)}, 502)
+                return
+            self._send(200, data, "application/octet-stream")
             return
         if path == "/api/videos":
             force = (parse_qs(parsed.query).get("force") or [""])[0] == "1"
@@ -2021,7 +2104,8 @@ class Handler(BaseHTTPRequestHandler):
         if not self._guard():
             self.close_connection = True
             return
-        if not hmac.compare_digest(self.headers.get("X-CSRF-Token", ""), CSRF):
+        if (not hmac.compare_digest(self.headers.get("X-CSRF-Token", ""), CSRF)
+                and not self.headers.get("Authorization", "").startswith("Basic ")):
             self._json({"ok": False, "error": "bad csrf token"}, 403)
             self.close_connection = True
             return
