@@ -154,7 +154,7 @@ sudo install -Dm600 bridge/dodaios-bridge.py /opt/media-web/bridge/dodaios-bridg
 sudo tee /etc/media-web.env >/dev/null <<'ENVEOF'
 MEDIA_WEB_USER=media
 MEDIA_WEB_PASSWORD=换成你的密码
-MEDIA_WIN_HOST=192.168.1.20      # 电脑的局域网 IP，用于在线探测 + WOL
+MEDIA_WIN_HOST=<电脑IP>            # 示例：电脑的局域网 IP，用于在线探测 + WOL
 MEDIA_WIN_MAC=aa:bb:cc:dd:ee:ff
 ENVEOF
 sudo chmod 600 /etc/media-web.env
